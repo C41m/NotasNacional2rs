@@ -2,24 +2,32 @@
 __pycache__/
 *.py[cod]
 *$py.class
-*.so
+*.pyo
 .Python
-venv/
-env/
-.env
 *.egg-info/
+*.egg
 dist/
 build/
+
+# Environments
+venv/
+env/
+.venv/
+.env
+.env.local
 
 # Database
 *.db
 *.sqlite
+.alembic/
 
 # Certificates
 *.pfx
 *.pem
+crt/
 
 # IDE
-.vscode/
 .idea/
+.vscode/
 *.swp
+*.swo

@@ -1,9 +1,13 @@
 services:
   - type: web
     name: 2rsnotas-backend
-    runtime: python
-    buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    runtime: docker
+    plan: free
     envVars:
-      - key: PYTHON_VERSION
-        value: 3.11.0
+      - key: DATABASE_URL
+        fromSecret: database-url
+      - key: CERT_KEY
+        fromSecret: cert-key
+      - key: CORS_ORIGINS
+        value: "*"
+    autoDeploy: true
