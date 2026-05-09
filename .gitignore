@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+.env
+*.egg-info/
+dist/
+build/
+
+# Database
+*.db
+*.sqlite
+
+# Certificates
+*.pfx
+*.pem
+
+# IDE
+.vscode/
+.idea/
+*.swp

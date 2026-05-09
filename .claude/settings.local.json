@@ -1,0 +1,23 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(venv/Scripts/pip install:*)",
+      "Bash(venv/Scripts/playwright install:*)",
+      "Bash(curl -s http://localhost:8000/health)",
+      "Bash(venv/Scripts/python -c \"from app.main import app\")",
+      "Bash(npx tailwindcss:*)",
+      "Bash(npx ng:*)",
+      "Bash(mkdir -p \"F:\\\\Projetos\\\\2RSNotas\\\\frontend\\\\src\\\\app\\\\models\")",
+      "Bash(mkdir -p \"F:\\\\Projetos\\\\2RSNotas\\\\frontend\\\\src\\\\app\\\\services\")",
+      "Bash(mkdir -p \"F:\\\\Projetos\\\\2RSNotas\\\\frontend\\\\src\\\\app\\\\components\\\\company-form\")",
+      "Bash(mkdir -p \"F:\\\\Projetos\\\\2RSNotas\\\\frontend\\\\src\\\\app\\\\components\\\\company-list\")",
+      "Bash(mkdir -p \"F:\\\\Projetos\\\\2RSNotas\\\\frontend\\\\src\\\\app\\\\components\\\\download-form\")",
+      "Bash(npm install:*)",
+      "Bash(python -m json.tool)",
+      "Bash(dir \"src\\\\app\\\\components\\\\company-form\")",
+      "Bash(ng serve:*)",
+      "Bash(findstr /V \"ERROR\")",
+      "Bash(findstr \"ERROR\")"
+    ]
+  }
+}
