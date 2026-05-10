@@ -5,7 +5,11 @@ from app.core.config import settings
 from app.models.base import Base
 from datetime import datetime
 
-engine = create_async_engine(settings.DATABASE_URL, echo=settings.LOG_LEVEL == "DEBUG")
+engine = create_async_engine(
+    settings.DATABASE_URL,
+    echo=settings.LOG_LEVEL == "DEBUG",
+    connect_args={"ssl": "require"}
+)
 
 async_session_factory = sessionmaker(
     engine, class_=AsyncSession, expire_on_commit=False
