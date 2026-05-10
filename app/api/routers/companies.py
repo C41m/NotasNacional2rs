@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import Session
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 from app.core.database import get_db
@@ -12,44 +12,44 @@ from typing import List
 router = APIRouter(prefix="/companies", tags=["companies"])
 
 @router.post("/", response_model=CompanyOut, status_code=status.HTTP_201_CREATED)
-async def create_company(company: CompanyCreate, db: AsyncSession = Depends(get_db)):
-    existing = await db.execute(select(Company).where(Company.cnpj == company.cnpj))
-    if existing.scalar_one_or_none():
+def create_company(company: CompanyCreate, db: Session = Depends(get_db)):
+    existing = db.execute(select(Company).where(Company.cnpj == company.cnpj)).scalar_one_or_none()
+    if existing:
         raise HTTPException(400, "CNPJ already registered")
 
     db_company = Company(nome=company.nome, cnpj=company.cnpj)
     db.add(db_company)
-    await db.commit()
-    await db.refresh(db_company)
+    db.commit()
+    db.refresh(db_company)
 
     try:
-        cert = await save_certificate(db, db_company.id, company.pfx_base64, company.password)
+        cert = save_certificate(db, db_company.id, company.pfx_base64, company.password)
     except Exception as e:
-        await db.rollback()
+        db.rollback()
         raise HTTPException(400, f"Certificate error: {str(e)}")
 
     return CompanyOut(**company.model_dump(), id=db_company.id, created_at=db_company.created_at, updated_at=db_company.updated_at, validade_cert=cert.validade)
 
 @router.get("/", response_model=List[CompanyOut])
-async def list_companies(page: int = 1, limit: int = 20, search: str = "", db: AsyncSession = Depends(get_db)):
+def list_companies(page: int = 1, limit: int = 20, search: str = "", db: Session = Depends(get_db)):
     query = select(Company).options(selectinload(Company.certificate))
     if search:
         query = query.where(Company.nome.icontains(search) | Company.cnpj.icontains(search))
-    result = await db.execute(query.offset((page-1)*limit).limit(limit))
+    result = db.execute(query.offset((page-1)*limit).limit(limit))
     companies = result.scalars().all()
     return [CompanyOut(**c.__dict__, validade_cert=c.certificate.validade if c.certificate else None) for c in companies]
 
 @router.get("/{company_id}", response_model=CompanyOut)
-async def get_company(company_id: int, db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(Company).options(selectinload(Company.certificate)).where(Company.id == company_id))
+def get_company(company_id: int, db: Session = Depends(get_db)):
+    result = db.execute(select(Company).options(selectinload(Company.certificate)).where(Company.id == company_id))
     company = result.scalar_one_or_none()
     if not company:
         raise HTTPException(404, "Company not found")
     return CompanyOut(**company.__dict__, validade_cert=company.certificate.validade if company.certificate else None)
 
 @router.patch("/{company_id}", response_model=CompanyOut)
-async def update_company(company_id: int, update: CompanyUpdate, db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(Company).options(selectinload(Company.certificate)).where(Company.id == company_id))
+def update_company(company_id: int, update: CompanyUpdate, db: Session = Depends(get_db)):
+    result = db.execute(select(Company).options(selectinload(Company.certificate)).where(Company.id == company_id))
     company = result.scalar_one_or_none()
     if not company:
         raise HTTPException(404, "Company not found")
@@ -61,18 +61,18 @@ async def update_company(company_id: int, update: CompanyUpdate, db: AsyncSessio
         if not update.pfx_base64 or not update.password:
             raise HTTPException(400, "Both PFX and password required for certificate update")
         if company.certificate:
-            await db.delete(company.certificate)
-        await save_certificate(db, company.id, update.pfx_base64, update.password)
+            db.delete(company.certificate)
+        save_certificate(db, company.id, update.pfx_base64, update.password)
 
-    await db.commit()
-    await db.refresh(company)
+    db.commit()
+    db.refresh(company)
     return CompanyOut(**company.__dict__, validade_cert=company.certificate.validade if company.certificate else None)
 
 @router.delete("/{company_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_company(company_id: int, db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(Company).where(Company.id == company_id))
+def delete_company(company_id: int, db: Session = Depends(get_db)):
+    result = db.execute(select(Company).where(Company.id == company_id))
     company = result.scalar_one_or_none()
     if not company:
         raise HTTPException(404, "Company not found")
-    await db.delete(company)
-    await db.commit()
+    db.delete(company)
+    db.commit()

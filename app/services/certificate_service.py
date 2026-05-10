@@ -3,7 +3,7 @@ from cryptography.hazmat.primitives import serialization
 from datetime import datetime, timezone
 from app.core.security import encrypt_bytes, decrypt_bytes
 from app.models.certificate import Certificate
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import Session
 from sqlalchemy import select
 from typing import Tuple
 import base64
@@ -11,7 +11,7 @@ import base64
 class CertificateError(Exception):
     pass
 
-async def validate_pfx(pfx_base64: str, password: str) -> Tuple[datetime, bytes, bytes]:
+def validate_pfx(pfx_base64: str, password: str) -> Tuple[datetime, bytes, bytes]:
     """Validate PFX and return (expiration, cert_pem, key_pem)."""
     try:
         pfx_data = base64.b64decode(pfx_base64)
@@ -34,9 +34,9 @@ async def validate_pfx(pfx_base64: str, password: str) -> Tuple[datetime, bytes,
     except Exception as e:
         raise CertificateError(f"PFX validation failed: {str(e)}") from e
 
-async def save_certificate(db: AsyncSession, company_id: int, pfx_base64: str, password: str) -> Certificate:
+def save_certificate(db: Session, company_id: int, pfx_base64: str, password: str) -> Certificate:
     """Validate and save encrypted certificate."""
-    not_after, _, _ = await validate_pfx(pfx_base64, password)
+    not_after, _, _ = validate_pfx(pfx_base64, password)
     pfx_data = base64.b64decode(pfx_base64)
 
     cert = Certificate(
@@ -46,13 +46,13 @@ async def save_certificate(db: AsyncSession, company_id: int, pfx_base64: str, p
         validade=not_after
     )
     db.add(cert)
-    await db.commit()
-    await db.refresh(cert)
+    db.commit()
+    db.refresh(cert)
     return cert
 
-async def get_certificate_pem(db: AsyncSession, company_id: int) -> Tuple[bytes, bytes, str]:
+def get_certificate_pem(db: Session, company_id: int) -> Tuple[bytes, bytes, str]:
     """Retrieve and convert certificate to PEM for Playwright."""
-    result = await db.execute(select(Certificate).where(Certificate.company_id == company_id))
+    result = db.execute(select(Certificate).where(Certificate.company_id == company_id))
     cert = result.scalar_one_or_none()
     if not cert:
         raise CertificateError("Certificate not found")
@@ -60,6 +60,6 @@ async def get_certificate_pem(db: AsyncSession, company_id: int) -> Tuple[bytes,
     password = decrypt_bytes(cert.senha_enc).decode()
     pfx_data = decrypt_bytes(cert.certificado_enc)
     pfx_base64 = base64.b64encode(pfx_data).decode()
-    _, cert_pem, key_pem = await validate_pfx(pfx_base64, password)
+    _, cert_pem, key_pem = validate_pfx(pfx_base64, password)
 
     return cert_pem, key_pem, password

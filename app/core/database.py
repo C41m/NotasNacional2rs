@@ -1,23 +1,29 @@
-from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy import event
+from sqlalchemy.pool import NullPool
 from app.core.config import settings
 from app.models.base import Base
 from datetime import datetime
 
-engine = create_async_engine(
+engine = create_engine(
     settings.DATABASE_URL,
     echo=settings.LOG_LEVEL == "DEBUG",
-    connect_args={"ssl": "require"}
+    poolclass=NullPool
 )
 
-async_session_factory = sessionmaker(
-    engine, class_=AsyncSession, expire_on_commit=False
+SessionLocal = sessionmaker(
+    autocommit=False,
+    autoflush=False,
+    bind=engine
 )
 
-async def get_db():
-    async with async_session_factory() as session:
-        yield session
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
 
 @event.listens_for(Base, "before_update", propagate=True)
 def set_updated_at(mapper, connection, target):
