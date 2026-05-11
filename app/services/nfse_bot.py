@@ -50,13 +50,13 @@ async def run_nfse_download_async(company_id: int, job_id: str, db: Session, cer
         page = await context.new_page()
 
         await page.goto("https://www.nfse.gov.br/EmissorNacional/Login?ReturnUrl=%2fEmissorNacional", timeout=10000)
-        await page.wait_for_selector("a.img-certificado", timeout=5000)
+        await page.wait_for_selector("a.img-certificado", timeout=30000)
         await page.click("a.img-certificado")
-        await page.wait_for_load_state("networkidle", timeout=5000)
+        await page.wait_for_load_state("networkidle", timeout=15000)
         await page.goto("https://www.nfse.gov.br/EmissorNacional/Notas/Emitidas", timeout=30000)
 
-        await page.wait_for_selector("#datainicio", timeout=5000)
-        await page.wait_for_selector("#datafim", timeout=5000)
+        await page.wait_for_selector("#datainicio", timeout=15000)
+        await page.wait_for_selector("#datafim", timeout=15000)
         await page.fill("#datainicio", datainicio)
         await page.fill("#datafim", datafim)
         await page.click("#searchbar > form > div:nth-child(3) > div:nth-child(2) > div:nth-child(2) > button")
