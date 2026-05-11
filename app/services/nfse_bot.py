@@ -19,6 +19,8 @@ async def run_nfse_download_async(company_id: int, job_id: str, db: Session, cer
     context = None
     temp_dir = None
     zip_path = None
+    cert_path = None
+    key_path = None
 
     try:
         # Update job to processing
@@ -32,8 +34,10 @@ async def run_nfse_download_async(company_id: int, job_id: str, db: Session, cer
         cnpj = company.cnpj.replace(".", "").replace("/", "").replace("-", "")
 
         # Definir caminho do ZIP com CNPJ e datas
+        jobs_dir = os.path.join(tempfile.gettempdir(), "jobs")
+        os.makedirs(jobs_dir, exist_ok=True)
         zip_path = os.path.join(
-            tempfile.gettempdir(), "jobs",
+            jobs_dir,
             f"NFSe_{cnpj}_{datainicio.replace('/', '-')}_{datafim.replace('/', '-')}.zip"
         )
         if os.path.exists(zip_path):
@@ -45,42 +49,43 @@ async def run_nfse_download_async(company_id: int, job_id: str, db: Session, cer
         context, cert_path, key_path = await create_mtls_context(cert_pem, key_pem, cert_password)
         page = await context.new_page()
 
-        await page.goto("https://www.nfse.gov.br/EmissorNacional/Login?ReturnUrl=%2fEmissorNacional", timeout=30000)
-        await page.wait_for_selector("a.img-certificado", timeout=15000)
+        await page.goto("https://www.nfse.gov.br/EmissorNacional/Login?ReturnUrl=%2fEmissorNacional", timeout=10000)
+        await page.wait_for_selector("a.img-certificado", timeout=5000)
         await page.click("a.img-certificado")
-        await page.wait_for_load_state("networkidle", timeout=15000)
+        await page.wait_for_load_state("networkidle", timeout=5000)
         await page.goto("https://www.nfse.gov.br/EmissorNacional/Notas/Emitidas", timeout=30000)
 
-        await page.wait_for_selector("#datainicio", timeout=15000)
-        await page.wait_for_selector("#datafim", timeout=15000)
+        await page.wait_for_selector("#datainicio", timeout=5000)
+        await page.wait_for_selector("#datafim", timeout=5000)
         await page.fill("#datainicio", datainicio)
         await page.fill("#datafim", datafim)
         await page.click("#searchbar > form > div:nth-child(3) > div:nth-child(2) > div:nth-child(2) > button")
 
         try:
-            await page.wait_for_selector("div.paginacao div.descricao", timeout=10000)
+            await page.wait_for_selector("div.paginacao div.descricao", timeout=5000)
             paginacao_text = await page.locator("div.paginacao div.descricao").inner_text()
+            print(f"[DEBUG] Paginação text: {paginacao_text}")
             match = re.search(r'Total de (\d+) registros', paginacao_text)
             if match:
                 total_registros = int(match.group(1))
                 job.total_registros = total_registros
                 db.commit()
-        except Exception:
-            pass
+            else:
+                print(f"[WARN] Pattern não encontrado no texto de paginação")
+        except Exception as e:
+            print(f"[WARN] Erro ao buscar total de registros: {e}")
 
         total_registros = getattr(job, 'total_registros', 0) or 0
         try:
             pagina_atual = 1
             while True:
-                await page.wait_for_selector("div.container.container-fluid-xl.container-body table tbody tr", timeout=15000)
-                await page.wait_for_timeout(1000)
+                await page.wait_for_selector("div.container.container-fluid-xl.container-body table tbody tr", timeout=5000)
 
                 rows = await page.locator("div.container.container-fluid-xl.container-body table tbody tr").all()
                 num_rows = len(rows)
 
                 for i in range(num_rows):
                     await page.evaluate("document.querySelectorAll('.popover').forEach(e => e.remove())")
-                    await page.wait_for_timeout(200)
                     row = page.locator("div.container.container-fluid-xl.container-body table tbody tr").nth(i)
                     options_btn = row.locator("a.icone-trigger").first
                     if await options_btn.count() == 0:
@@ -88,9 +93,10 @@ async def run_nfse_download_async(company_id: int, job_id: str, db: Session, cer
                     if await options_btn.count() == 0:
                         continue
                     await options_btn.click()
-                    await page.wait_for_timeout(300)
                     try:
                         xml_link = page.locator("div.popover:visible a:has-text('Download XML')").first
+                        if await xml_link.count() == 0:
+                            continue
                         await xml_link.wait_for(state="visible", timeout=3000)
                         href = await xml_link.get_attribute("href")
                         nf_num = "unknown"
@@ -98,15 +104,47 @@ async def run_nfse_download_async(company_id: int, job_id: str, db: Session, cer
                             match = re.search(r'/NFSe/(\d+)', href)
                             if match:
                                 nf_num = match.group(1)
-                        async with page.expect_download(timeout=10000) as download_info:
+
+                        # Tenta capturar download
+                        download = None
+                        dest_path = None
+                        initial_pages = len(page.context.pages)
+
+                        try:
+                            async with page.expect_download() as download_info:
+                                await xml_link.click()
+                            download = await download_info.value
+                        except Exception:
+                            # expect_download falhou, tenta via popup
                             await xml_link.click()
-                        download = await download_info.value
-                        suggested_name = download.suggested_filename or f"NFSe_{nf_num}.xml"
-                        if not suggested_name.lower().endswith('.xml'):
-                            suggested_name = f"NFSe_{nf_num}.xml"
-                        dest_path = os.path.join(temp_dir, suggested_name)
-                        await download.save_as(dest_path)
-                        if os.path.exists(dest_path):
+                            # Aguarda popup ou download
+                            try:
+                                await page.wait_for_selector("div.popover:visible", timeout=2000)
+                            except Exception:
+                                pass
+
+                        # Verifica se abriu popup
+                        if download is None and len(page.context.pages) > initial_pages:
+                            popup = page.context.pages[-1]
+                            try:
+                                await popup.wait_for_load_state("networkidle", timeout=3000)
+                                content = await popup.content()
+                                dest_path = os.path.join(temp_dir, f"NFSe_{nf_num}.xml")
+                                with open(dest_path, "w", encoding="utf-8") as f:
+                                    f.write(content)
+                                await popup.close()
+                            except Exception:
+                                pass
+
+                        # Salva download se obtido
+                        if download and dest_path is None:
+                            dest_path = os.path.join(temp_dir, f"NFSe_{nf_num}.xml")
+                            try:
+                                await download.save_as(dest_path)
+                            except Exception:
+                                dest_path = None
+
+                        if dest_path and os.path.exists(dest_path):
                             job.notas_processed = (job.notas_processed or 0) + 1
                             db.commit()
                             if progress_callback:
@@ -120,7 +158,7 @@ async def run_nfse_download_async(company_id: int, job_id: str, db: Session, cer
                     if "disabled" not in classes:
                         next_btn = next_li.locator("a").first
                         await next_btn.click()
-                        await page.wait_for_load_state("networkidle", timeout=15000)
+                        await page.wait_for_load_state("networkidle", timeout=5000)
                         pagina_atual += 1
                     else:
                         break
