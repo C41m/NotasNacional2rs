@@ -3,6 +3,7 @@ services:
     name: 2rsnotas-backend
     runtime: docker
     plan: free
+    shmSize: 128mb
     envVars:
       - key: DATABASE_URL
         fromSecret: database-url
