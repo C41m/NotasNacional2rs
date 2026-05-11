@@ -22,7 +22,7 @@ async def get_browser() -> Browser:
             loop = asyncio.get_event_loop()
         playwright = await async_playwright().start()
         _browser = await playwright.chromium.launch(
-            headless=False,
+            headless=True,
             args=["--no-sandbox", "--disable-dev-shm-usage"]
         )
     return _browser
