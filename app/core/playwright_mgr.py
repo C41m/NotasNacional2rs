@@ -1,49 +1,69 @@
-import sys
 import asyncio
-import threading
 
-if sys.platform.startswith("win"):
-    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
-
-from playwright.async_api import async_playwright, Browser, BrowserContext
+from playwright.async_api import async_playwright, Browser
 from typing import Optional, Tuple
 import tempfile
 import os
 
-# Thread-local storage for browser instances
-_thread_local = threading.local()
 
-async def _get_browser() -> Browser:
-    """Get or create browser instance for current thread."""
-    thread_id = threading.current_thread().ident
-    if not hasattr(_thread_local, 'browsers'):
-        _thread_local.browsers = {}
+# Configurações do Chromium — usadas tanto para browser singleton quanto para contexts
+CHROMIUM_ARGS = [
+    "--no-sandbox",
+    "--disable-dev-shm-usage",
+    "--disable-gpu",
+    "--disable-setuid-sandbox",
+]
 
-    browser_key = f"browser_{thread_id}"
-    browser = _thread_local.browsers.get(browser_key)
+CHROMIUM_KWARGS = dict(
+    headless=False,
+    args=CHROMIUM_ARGS,
+)
 
-    if browser is None or not browser.is_connected():
+
+async def get_shared_browser() -> Browser:
+    """
+    Retorna um browser singleton compartilhado (um único processo Chromium).
+    Cria o browser se ainda não existir no event loop atual.
+    """
+    loop = asyncio.get_running_loop()
+    key = "_shared_browser"
+
+    if not hasattr(loop, key):
         playwright = await async_playwright().start()
-        browser = await playwright.chromium.launch(
-            headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-gpu",
-                "--disable-setuid-sandbox",
-            ]
-        )
-        _thread_local.browsers[browser_key] = browser
+        browser = await playwright.chromium.launch(**CHROMIUM_KWARGS)
+        # Armazena browser e playwright para cleanup posterior
+        setattr(loop, key, browser)
+        setattr(loop, "_shared_playwright", playwright)
 
-        # Store playwright for cleanup
-        _thread_local.browsers[f"playwright_{thread_id}"] = playwright
+    return getattr(loop, key)
 
-    return browser
 
-async def create_mtls_context(cert_pem: bytes, key_pem: bytes, password: Optional[str] = None) -> Tuple[BrowserContext, str, str]:
-    """Create browser context with mTLS client certificate."""
-    browser = await _get_browser()
+async def close_shared_browser():
+    """Fecha o browser singleton do event loop atual."""
+    loop = asyncio.get_running_loop()
+    browser = getattr(loop, "_shared_browser", None)
+    playwright = getattr(loop, "_shared_playwright", None)
 
+    if browser and browser.is_connected():
+        await browser.close()
+    if playwright:
+        await playwright.stop()
+
+    for attr in ("_shared_browser", "_shared_playwright"):
+        if hasattr(loop, attr):
+            delattr(loop, attr)
+
+
+async def create_mtls_context_from_browser(
+    browser: Browser,
+    cert_pem: bytes,
+    key_pem: bytes,
+    password: Optional[str] = None,
+) -> Tuple:
+    """
+    Cria um BrowserContext isolado com certificado mTLS.
+    Muito mais leve que criar um novo browser — compartilha o mesmo processo Chromium.
+    """
     cert_fd, cert_path = tempfile.mkstemp(suffix=".pem")
     key_fd, key_path = tempfile.mkstemp(suffix=".pem")
 
@@ -62,19 +82,15 @@ async def create_mtls_context(cert_pem: bytes, key_pem: bytes, password: Optiona
         user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         viewport={"width": 1280, "height": 720},
         locale="pt-BR",
-        timezone_id="America/Sao_Paulo"
+        timezone_id="America/Sao_Paulo",
     )
 
     return context, cert_path, key_path
 
-async def close_browser():
-    """Cleanup browser for current thread."""
-    thread_id = threading.current_thread().ident
-    if hasattr(_thread_local, 'browsers'):
-        browser = _thread_local.browsers.pop(f"browser_{thread_id}", None)
-        playwright = _thread_local.browsers.pop(f"playwright_{thread_id}", None)
 
-        if browser and browser.is_connected():
-            await browser.close()
-        if playwright:
-            await playwright.stop()
+async def create_mtls_context(cert_pem: bytes, key_pem: bytes, password: Optional[str] = None) -> Tuple:
+    """
+    API backward-compatible: cria contexto mTLS a partir do browser singleton.
+    """
+    browser = await get_shared_browser()
+    return await create_mtls_context_from_browser(browser, cert_pem, key_pem, password)
