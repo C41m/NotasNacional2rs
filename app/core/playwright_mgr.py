@@ -1,12 +1,12 @@
 import asyncio
 
 from playwright.async_api import async_playwright, Browser
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Dict, Any
 import tempfile
 import os
 
 
-# Configurações do Chromium — usadas tanto para browser singleton quanto para contexts
+# Configurações do Chromium — headless para economizar CPU/memória no servidor
 CHROMIUM_ARGS = [
     "--no-sandbox",
     "--disable-dev-shm-usage",
@@ -15,82 +15,68 @@ CHROMIUM_ARGS = [
 ]
 
 CHROMIUM_KWARGS = dict(
-    headless=False,
+    headless=True,
     args=CHROMIUM_ARGS,
 )
 
+# Máximo de browsers simultâneos (~150MB cada, 2 = ~300MB total — seguro no Render free)
+MAX_CONCURRENT_BROWSERS = 2
 
-async def get_shared_browser() -> Browser:
+
+async def launch_dedicated_browser() -> Tuple[async_playwright, Browser]:
     """
-    Retorna um browser singleton compartilhado (um único processo Chromium).
-    Cria o browser se ainda não existir no event loop atual.
+    Inicia um processo Chromium dedicado para uma task.
+    Retorna (playwright, browser) — o chamador é responsável por fechar ambos.
     """
-    loop = asyncio.get_running_loop()
-    key = "_shared_browser"
-
-    if not hasattr(loop, key):
-        playwright = await async_playwright().start()
-        browser = await playwright.chromium.launch(**CHROMIUM_KWARGS)
-        # Armazena browser e playwright para cleanup posterior
-        setattr(loop, key, browser)
-        setattr(loop, "_shared_playwright", playwright)
-
-    return getattr(loop, key)
+    pw = await async_playwright().start()
+    browser = await pw.chromium.launch(**CHROMIUM_KWARGS)
+    return pw, browser
 
 
-async def close_shared_browser():
-    """Fecha o browser singleton do event loop atual."""
-    loop = asyncio.get_running_loop()
-    browser = getattr(loop, "_shared_browser", None)
-    playwright = getattr(loop, "_shared_playwright", None)
-
-    if browser and browser.is_connected():
-        await browser.close()
-    if playwright:
-        await playwright.stop()
-
-    for attr in ("_shared_browser", "_shared_playwright"):
-        if hasattr(loop, attr):
-            delattr(loop, attr)
-
-
-async def create_mtls_context_from_browser(
+async def create_mtls_context(
     browser: Browser,
     cert_pem: bytes,
     key_pem: bytes,
     password: Optional[str] = None,
 ) -> Tuple:
     """
-    Cria um BrowserContext isolado com certificado mTLS.
-    Muito mais leve que criar um novo browser — compartilha o mesmo processo Chromium.
+    Cria um BrowserContext isolado com certificado mTLS no browser indicado.
     """
     cert_fd, cert_path = tempfile.mkstemp(suffix=".pem")
     key_fd, key_path = tempfile.mkstemp(suffix=".pem")
 
-    with os.fdopen(cert_fd, "wb") as f:
-        f.write(cert_pem)
-    with os.fdopen(key_fd, "wb") as f:
-        f.write(key_pem)
+    try:
+        with os.fdopen(cert_fd, "wb") as f:
+            f.write(cert_pem)
+        with os.fdopen(key_fd, "wb") as f:
+            f.write(key_pem)
 
-    context = await browser.new_context(
-        client_certificates=[{
-            "origin": "https://www.nfse.gov.br",
-            "certPath": cert_path,
-            "keyPath": key_path,
-            **({"passphrase": password} if password else {})
-        }],
-        user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        viewport={"width": 1280, "height": 720},
-        locale="pt-BR",
-        timezone_id="America/Sao_Paulo",
-    )
+        context = await browser.new_context(
+            client_certificates=[{
+                "origin": "https://www.nfse.gov.br",
+                "certPath": cert_path,
+                "keyPath": key_path,
+                **({"passphrase": password} if password else {})
+            }],
+            user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            viewport={"width": 1280, "height": 720},
+            locale="pt-BR",
+            timezone_id="America/Sao_Paulo",
+        )
 
-    return context, cert_path, key_path
+        return context, cert_path, key_path
+    except Exception:
+        # Limpa arquivos temporários em caso de erro
+        if os.path.exists(cert_path):
+            os.unlink(cert_path)
+        if os.path.exists(key_path):
+            os.unlink(key_path)
+        raise
 
 
-async def create_mtls_context(cert_pem: bytes, key_pem: bytes, password: Optional[str] = None) -> Tuple:
-    """
-    API backward-compatible: cria contexto mTLS a partir do browser singleton.
-    """
-    browser = await get_shared_browser()
-    return await create_mtls_context_from_browser(browser, cert_pem, key_pem, password)
+async def close_browser(pw: async_playwright, browser: Browser):
+    """Fecha o browser e o playwright de forma segura."""
+    if browser and browser.is_connected():
+        await browser.close()
+    if pw:
+        await pw.stop()

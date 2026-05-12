@@ -1,6 +1,6 @@
 import re
 import asyncio
-from playwright.async_api import BrowserContext, Download
+from playwright.async_api import BrowserContext, Download, Browser
 from tenacity import retry, stop_after_attempt, wait_exponential
 from app.core.playwright_mgr import create_mtls_context
 from app.models.download_job import DownloadJob
@@ -14,8 +14,20 @@ from datetime import datetime
 class NFSeBotError(Exception):
     pass
 
-async def run_nfse_download_async(company_id: int, job_id: str, db: Session, cert_pem: bytes, key_pem: bytes, cert_password: str, datainicio: str = "01/04/2026", datafim: str = "30/04/2026", progress_callback=None):
-    """Execute NFSe download with mTLS and retry logic."""
+
+async def run_nfse_download_async(
+    company_id: int,
+    job_id: str,
+    db: Session,
+    cert_pem: bytes,
+    key_pem: bytes,
+    cert_password: str,
+    browser: Browser,
+    datainicio: str = "01/04/2026",
+    datafim: str = "30/04/2026",
+    progress_callback=None,
+):
+    """Execute NFSe download com mTLS e retry logic, usando o browser dedicado recebido."""
     context = None
     temp_dir = None
     zip_path = None
@@ -46,7 +58,10 @@ async def run_nfse_download_async(company_id: int, job_id: str, db: Session, cer
         temp_dir = os.path.join(tempfile.gettempdir(), "nfse_downloads", cnpj, job_id)
         os.makedirs(temp_dir, exist_ok=True)
 
-        context, cert_path, key_path = await create_mtls_context(cert_pem, key_pem, cert_password)
+        # Cria contexto mTLS no browser dedicado (sem contenção com outras tasks)
+        context, cert_path, key_path = await create_mtls_context(
+            browser, cert_pem, key_pem, cert_password
+        )
         page = await context.new_page()
 
         await page.goto("https://www.nfse.gov.br/EmissorNacional/Login?ReturnUrl=%2fEmissorNacional", timeout=10000)
@@ -61,6 +76,7 @@ async def run_nfse_download_async(company_id: int, job_id: str, db: Session, cer
         await page.fill("#datafim", datafim)
         await page.click("#searchbar > form > div:nth-child(3) > div:nth-child(2) > div:nth-child(2) > button")
 
+        total_registros = 0
         try:
             await page.wait_for_selector("div.paginacao div.descricao", timeout=5000)
             paginacao_text = await page.locator("div.paginacao div.descricao").inner_text()
@@ -69,13 +85,11 @@ async def run_nfse_download_async(company_id: int, job_id: str, db: Session, cer
             if match:
                 total_registros = int(match.group(1))
                 job.total_registros = total_registros
-                db.commit()
             else:
                 print(f"[WARN] Pattern não encontrado no texto de paginação")
         except Exception as e:
             print(f"[WARN] Erro ao buscar total de registros: {e}")
-
-        total_registros = getattr(job, 'total_registros', 0) or 0
+        local_count = 0
         try:
             pagina_atual = 1
             while True:
@@ -116,6 +130,7 @@ async def run_nfse_download_async(company_id: int, job_id: str, db: Session, cer
                             download = await download_info.value
                         except Exception:
                             # expect_download falhou, tenta via popup
+                            print("Download falhou, tentando via popup")
                             await xml_link.click()
                             # Aguarda popup ou download
                             try:
@@ -145,10 +160,9 @@ async def run_nfse_download_async(company_id: int, job_id: str, db: Session, cer
                                 dest_path = None
 
                         if dest_path and os.path.exists(dest_path):
-                            job.notas_processed = (job.notas_processed or 0) + 1
-                            db.commit()
+                            local_count += 1
                             if progress_callback:
-                                await progress_callback(company_id, job.notas_processed, total_registros or 0)
+                                await progress_callback(company_id, local_count, total_registros or 0)
                     except Exception as e:
                         print(f"Erro no download XML: {e}")
 
@@ -176,6 +190,7 @@ async def run_nfse_download_async(company_id: int, job_id: str, db: Session, cer
 
         job.status = "success"
         job.file_url = zip_path
+        job.notas_processed = local_count
         job.datainicio = datainicio
         job.datafim = datafim
         job.finished_at = datetime.utcnow()

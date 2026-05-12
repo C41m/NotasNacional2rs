@@ -8,6 +8,11 @@ from app.models.download_job import DownloadJob
 from app.models.company import Company
 from app.services.certificate_service import get_certificate_pem
 from app.services.nfse_bot import run_nfse_download_async as run_nfse_download
+from app.core.playwright_mgr import (
+    launch_dedicated_browser,
+    close_browser,
+    MAX_CONCURRENT_BROWSERS,
+)
 import uuid
 import os
 import tempfile
@@ -15,7 +20,6 @@ import zipfile
 import asyncio
 from datetime import datetime
 
-from app.core.playwright_mgr import close_shared_browser
 
 # Dicionário global para acompanhar batches
 batch_status = {}
@@ -32,19 +36,24 @@ async def _process_single_company_async(
 ):
     """
     Processa download para uma única empresa de forma assíncrona.
-    Usa o semáforo para limitar a 2 concorrentes.
-    Cada empresa recebe seu próprio BrowserContext isolado (com mTLS),
-    mas compartilha o mesmo processo Chromium — muito mais leve.
+    - Usa semáforo para limitar concorrência de browsers dedicados
+    - Cada chamada cria seu próprio processo Chromium (dedicado, sem contenção)
+    - Retorna (company_id, zip_path | None, error | None, cnpj, nome)
     """
     async with semaphore:
         db = SessionLocal()
+        playwright = None
+        browser = None
         try:
-            cert_pem, key_pem, password = get_certificate_pem(db, company_id)
-
             # Buscar dados da empresa para exibir CNPJ e nome no frontend
             company = db.execute(select(Company).where(Company.id == company_id)).scalar_one()
             cnpj = company.cnpj
             nome = company.nome
+
+            cert_pem, key_pem, password = get_certificate_pem(db, company_id)
+
+            # Lançar browser dedicado para esta task — sem contenção
+            playwright, browser = await launch_dedicated_browser()
 
             job_id = str(uuid.uuid4())
             job = DownloadJob(
@@ -69,7 +78,10 @@ async def _process_single_company_async(
 
             zip_path = await run_nfse_download(
                 company_id, job_id, db, cert_pem, key_pem, password,
-                datainicio, datafim, progress_callback=progress_callback,
+                browser=browser,
+                datainicio=datainicio,
+                datafim=datafim,
+                progress_callback=progress_callback,
             )
 
             if zip_path and os.path.exists(zip_path):
@@ -79,16 +91,18 @@ async def _process_single_company_async(
         except Exception as e:
             return (company_id, None, str(e), "", "")
         finally:
+            # Fechar browser dedicado em qualquer cenário
+            if playwright is not None or browser is not None:
+                await close_browser(playwright, browser)
             db.close()
 
 
 def process_batch(batch_id: str, company_ids: list, datainicio: str, datafim: str):
     """
     Processa download para múltiplas empresas.
-    Executa todas as tasks assíncronas em um ÚNICO event loop,
-    com concorrência controlada por Semaphore.
-    Cada empresa roda em seu próprio BrowserContext isolado dentro de um
-    único processo Chromium — leve e sem estouro de memória no Render.
+    - Cada empresa roda em seu próprio processo Chromium dedicado
+    - Semáforo limita a MAX_CONCURRENT_BROWSERS para controlar memória
+    - Progresso atualizado em tempo real via lock
     """
     try:
         batch_status[batch_id] = {
@@ -100,7 +114,8 @@ def process_batch(batch_id: str, company_ids: list, datainicio: str, datafim: st
         }
         print(
             f"[Batch {batch_id}] Iniciando processamento de "
-            f"{len(company_ids)} empresas (max {len(company_ids)} concorrentes)..."
+            f"{len(company_ids)} empresas (max {MAX_CONCURRENT_BROWSERS} "
+            f"browsers simultâneos)..."
         )
 
         for cid in company_ids:
@@ -113,28 +128,32 @@ def process_batch(batch_id: str, company_ids: list, datainicio: str, datafim: st
             }
 
         zip_paths = []
+        errors = []
         done_count = 0
 
         async def _run_all():
-            """Executa todos os downloads e cleanup em um único event loop."""
-            nonlocal done_count, zip_paths
+            """Executa todos os downloads em um único event loop."""
+            nonlocal done_count, zip_paths, errors
 
             # Lock para atualizar batch_status de forma segura entre tasks
             lock = asyncio.Lock()
 
-            # Semáforo criado DENTRO do event loop para funcionar corretamente
-            semaphore = asyncio.Semaphore(5)
+            # Semáforo: no máximo MAX_CONCURRENT_BROWSERS browsers ao mesmo tempo
+            semaphore = asyncio.Semaphore(MAX_CONCURRENT_BROWSERS)
 
             async def _process_and_track(cid):
                 """Processa uma empresa e atualiza progresso em tempo real."""
                 nonlocal done_count
-                result = await _process_single_company_async(cid, datainicio, datafim, batch_id, semaphore)
+                result = await _process_single_company_async(
+                    cid, datainicio, datafim, batch_id, semaphore
+                )
 
                 async with lock:
                     done_count += 1
                     batch_status[batch_id]["done"] = done_count
 
                     if isinstance(result, Exception):
+                        errors.append(str(result))
                         print(f"[Batch {batch_id}] Erro inesperado na empresa {cid}: {result}")
                         batch_status[batch_id]["companies"][cid]["status"] = "failed"
                         return
@@ -146,6 +165,7 @@ def process_batch(batch_id: str, company_ids: list, datainicio: str, datafim: st
                     batch_status[batch_id]["companies"][cid]["nome"] = nome
 
                     if err:
+                        errors.append(err)
                         print(f"[Batch {batch_id}] Erro na empresa {cid}: {err}")
                         batch_status[batch_id]["companies"][cid]["status"] = "failed"
                     elif zp:
@@ -163,9 +183,6 @@ def process_batch(batch_id: str, company_ids: list, datainicio: str, datafim: st
                 for cid in company_ids
             ]
             await asyncio.gather(*tasks, return_exceptions=True)
-
-            # Cleanup do browser singleton após todos os downloads terminarem
-            await close_shared_browser()
 
         # Uma única chamada asyncio.run() — tudo no mesmo event loop
         asyncio.run(_run_all())
@@ -199,7 +216,8 @@ def process_batch(batch_id: str, company_ids: list, datainicio: str, datafim: st
             )
         else:
             batch_status[batch_id]["status"] = "failed"
-            print(f"[Batch {batch_id}] Falhou: nenhum ZIP gerado")
+            batch_status[batch_id]["error"] = "Nenhum ZIP gerado"
+            print(f"[Batch {batch_id}] Falhou: nenhum ZIP gerado. Erros: {errors}")
 
     except Exception as e:
         batch_status[batch_id]["status"] = "failed"
@@ -269,10 +287,14 @@ def _run_single_sync(job_id: str, company_id: int):
 
     async def _run():
         db = SessionLocal()
+        playwright = None
+        browser = None
         try:
+            playwright, browser = await launch_dedicated_browser()
             cert_pem, key_pem, password = get_certificate_pem(db, company_id)
             await run_nfse_download(
-                company_id, job_id, db, cert_pem, key_pem, password
+                company_id, job_id, db, cert_pem, key_pem, password,
+                browser=browser,
             )
         except Exception as e:
             db2 = SessionLocal()
@@ -291,10 +313,12 @@ def _run_single_sync(job_id: str, company_id: int):
             finally:
                 db2.close()
         finally:
+            # Fecha browser dedicado em qualquer cenário (sucesso ou erro)
+            try:
+                await close_browser(playwright, browser)
+            except Exception:
+                pass
             db.close()
-
-        # Cleanup do browser singleton após o download terminar
-        await close_shared_browser()
 
     asyncio.run(_run())
 
