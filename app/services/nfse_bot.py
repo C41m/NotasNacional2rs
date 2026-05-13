@@ -23,6 +23,8 @@ async def run_nfse_download_async(
     key_pem: bytes,
     cert_password: str,
     browser: Browser,
+    batch_status: dict | None = None,
+    batch_id: str | None = None,
     datainicio: str = "01/04/2026",
     datafim: str = "30/04/2026",
     progress_callback=None,
@@ -93,6 +95,17 @@ async def run_nfse_download_async(
         try:
             pagina_atual = 1
             while True:
+                # Verifica se o batch foi cancelado
+                if batch_status and batch_status.get(batch_id, {}).get("cancelled"):
+                    print(f"[Batch {batch_id}] Cancelamento solicitado, encerrando...")
+                    batch_status[batch_id]["status"] = "cancelled"
+                    batch_status[batch_id]["error"] = "Cancelado pelo usuário"
+                    job.status = "cancelled"
+                    job.error_message = "Cancelado pelo usuário"
+                    job.finished_at = datetime.utcnow()
+                    db.commit()
+                    return None
+
                 await page.wait_for_selector("div.container.container-fluid-xl.container-body table tbody tr", timeout=5000)
 
                 rows = await page.locator("div.container.container-fluid-xl.container-body table tbody tr").all()

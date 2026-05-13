@@ -3,12 +3,14 @@ services:
     name: 2rsnotas-backend
     runtime: docker
     plan: free
-    shmSize: 128mb
+    shmSize: 256
     envVars:
       - key: DATABASE_URL
         fromSecret: database-url
       - key: CERT_KEY
         fromSecret: cert-key
       - key: CORS_ORIGINS
-        value: "*"
+        fromSecret: cors-origins
+      - key: PORT
+        value: "8000"
     autoDeploy: true

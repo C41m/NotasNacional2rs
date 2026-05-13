@@ -32,6 +32,7 @@ async def _process_single_company_async(
     datainicio: str,
     datafim: str,
     batch_id: str,
+    batch_status: dict,
     semaphore: asyncio.Semaphore,
 ):
     """
@@ -81,6 +82,8 @@ async def _process_single_company_async(
                 browser=browser,
                 datainicio=datainicio,
                 datafim=datafim,
+                batch_status=batch_status,
+                batch_id=batch_id,
                 progress_callback=progress_callback,
             )
 
@@ -111,6 +114,9 @@ def process_batch(batch_id: str, company_ids: list, datainicio: str, datafim: st
             "status": "processing",
             "zip_path": None,
             "companies": {},
+            "datainicio": datainicio,
+            "datafim": datafim,
+            "created_at": datetime.utcnow().isoformat(),
         }
         print(
             f"[Batch {batch_id}] Iniciando processamento de "
@@ -145,7 +151,7 @@ def process_batch(batch_id: str, company_ids: list, datainicio: str, datafim: st
                 """Processa uma empresa e atualiza progresso em tempo real."""
                 nonlocal done_count
                 result = await _process_single_company_async(
-                    cid, datainicio, datafim, batch_id, semaphore
+                    cid, datainicio, datafim, batch_id, batch_status, semaphore
                 )
 
                 async with lock:
@@ -244,11 +250,45 @@ def start_batch_download(
     return {"batch_id": batch_id, "status": "queued"}
 
 
+@router.get("/batch-download/active")
+def list_active_batches(db: Session = Depends(get_db)):
+    """Lista todos os batches que ainda estão em memória (processing, queued, cancelling, success, failed)."""
+    result = {}
+    for bid, bdata in batch_status.items():
+        companies_info = {}
+        for cid, cdata in bdata.get("companies", {}).items():
+            company = db.execute(
+                select(Company).where(Company.id == int(cid))
+            ).scalar_one_or_none()
+            companies_info[cid] = {
+                **cdata,
+                "nome": company.nome if company else cdata.get("nome", "Desconhecida"),
+                "cnpj": company.cnpj if company else cdata.get("cnpj", ""),
+            }
+        result[bid] = {
+            **bdata,
+            "companies": companies_info,
+        }
+    return result
+
+
 @router.get("/batch-download/{batch_id}")
 def get_batch_status(batch_id: str):
     if batch_id not in batch_status:
         raise HTTPException(404, "Batch not found")
     return batch_status[batch_id]
+
+
+@router.patch("/batch-download/{batch_id}/cancel")
+def cancel_batch(batch_id: str):
+    if batch_id not in batch_status:
+        raise HTTPException(404, "Batch not found")
+    batch = batch_status[batch_id]
+    if batch["status"] not in ("queued", "processing"):
+        raise HTTPException(400, f"Batch está '{batch['status']}', não pode ser cancelado")
+    batch["cancelled"] = True
+    batch["status"] = "cancelling"
+    return {"message": "Cancelamento solicitado com sucesso"}
 
 
 @router.get("/batch-download/{batch_id}/file")
@@ -264,16 +304,17 @@ def download_batch_file(batch_id: str, background_tasks: BackgroundTasks):
     zip_path = batch["zip_path"]
     filename = os.path.basename(zip_path)
 
-    def cleanup():
+    def cleanup_after_download():
         import time
 
-        time.sleep(60)
+        # Aguarda 5 minutos após o download antes de limpar
+        time.sleep(300)
         if os.path.exists(zip_path):
             os.remove(zip_path)
         if batch_id in batch_status:
             del batch_status[batch_id]
 
-    background_tasks.add_task(cleanup)
+    background_tasks.add_task(cleanup_after_download)
 
     return FileResponse(
         path=zip_path,
