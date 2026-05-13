@@ -62,6 +62,8 @@ async def create_mtls_context(
             viewport={"width": 1280, "height": 720},
             locale="pt-BR",
             timezone_id="America/Sao_Paulo",
+            ignore_https_errors=False,
+            java_script_enabled=True
         )
 
         return context, cert_path, key_path
