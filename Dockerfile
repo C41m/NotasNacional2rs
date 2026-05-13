@@ -30,15 +30,23 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# ✅ CORREÇÃO: Removido --with-deps (deps já instaladas acima)
+# ✅ Definir path fixo ANTES de instalar os browsers
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+
+# Instalar Chromium no path fixo (sem --with-deps)
 RUN playwright install chromium
 
 # Copy application
 COPY . .
 
-# Non-root user
-RUN useradd -m appuser && chown -R appuser:appuser /app
+# ✅ Garantir que appuser tenha acesso ao diretório dos browsers
+RUN useradd -m appuser \
+    && chown -R appuser:appuser /app /ms-playwright
+
 USER appuser
+
+# ✅ Manter a mesma env var no runtime
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=5 \
   CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')" || exit 1
