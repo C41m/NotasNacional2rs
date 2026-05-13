@@ -30,13 +30,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Install Playwright Chromium + deps in one shot
-RUN playwright install --with-deps chromium
+# ✅ CORREÇÃO: Removido --with-deps (deps já instaladas acima)
+RUN playwright install chromium
 
 # Copy application
 COPY . .
 
-# Non-root user (created before chown)
+# Non-root user
 RUN useradd -m appuser && chown -R appuser:appuser /app
 USER appuser
 
