@@ -7,7 +7,6 @@ venv/
 node_modules
 frontend
 dist
-*.env
 .env.*
 pytest.ini
 .coverage

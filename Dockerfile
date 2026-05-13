@@ -45,19 +45,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=deps /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
 COPY --from=deps /usr/local/bin /usr/local/bin
 
-# Install Playwright browsers (with bundled deps)
-RUN python -m playwright install --with-deps chromium
+# ✅ CORREÇÃO: Removido --with-deps (deps já instaladas manualmente)
+RUN python -m playwright install chromium
 
-# Copy application
-COPY . .
+# ✅ CORREÇÃO: Copiar com ownership correto ANTES de criar o usuário
+COPY --chown=appuser:appuser . .
 
-# Healthcheck
-HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
-  CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"
+# ✅ CORREÇÃO: Criar usuário antes do HEALTHCHECK para evitar conflito de permissão
+RUN useradd -m appuser \
+    && chown -R appuser:appuser /app
 
-# Non-root user for security
-RUN useradd -m appuser
 USER appuser
+
+# ✅ CORREÇÃO: Healthcheck compatível com urllib e timeout adequado
+HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
+  CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')" || exit 1
 
 EXPOSE 8000
 
