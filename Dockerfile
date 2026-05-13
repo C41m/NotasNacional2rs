@@ -3,51 +3,79 @@ FROM python:3.11-slim AS builder
 
 WORKDIR /app
 
-# Install build-time system dependencies (only what's needed to compile)
+# Install build-time system dependencies (including Playwright deps)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
     libpq-dev \
+    libnss3 \
+    libatk-bridge2.0-0 \
+    libgbm1 \
+    libxcomposite1 \
+    libxdamage1 \
+    libxfixes3 \
+    libxrandr2 \
+    libxkbcommon0 \
+    libxshmfence1 \
+    libasound2 \
+    libatspi2.0-0 \
+    libdrm2 \
+    libpango-1.0-0 \
+    libcairo2 \
+    libgdk-pixbuf2.0-0 \
+    libgtk-3-0 \
+    libnspr4 \
+    libx11-xcb1 \
+    libxtst6 \
+    libcups2 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
+
+# Install Playwright browsers (with deps) in the builder stage
+RUN python -m playwright install --with-deps chromium
 
 # ---- Stage 2: Runtime ----
 FROM python:3.11-slim
 
 WORKDIR /app
 
-# Only runtime dependencies for headless Chromium — NO GUI libs
+# Runtime dependencies for headless Chromium
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libnss3 \
     libatk-bridge2.0-0 \
-    libcups2 \
-    libdrm2 \
-    libxkbcommon0 \
+    libgbm1 \
     libxcomposite1 \
     libxdamage1 \
     libxfixes3 \
     libxrandr2 \
-    libgbm1 \
+    libxkbcommon0 \
     libxshmfence1 \
+    libasound2 \
+    libatspi2.0-0 \
+    libdrm2 \
+    libpango-1.0-0 \
+    libcairo2 \
+    libgdk-pixbuf2.0-0 \
+    libgtk-3-0 \
+    libnspr4 \
     libx11-xcb1 \
     libxtst6 \
+    libcups2 \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Playwright browsers
-RUN python -m playwright install chromium
-
-# Copy only installed packages from builder
+# Copy Python packages from builder
 COPY --from=builder /install /usr/local
 
-# Copy application (uses .dockerignore)
+# Copy Playwright browsers cache from builder
+COPY --from=builder /root/.cache/ms-playwright /root/.cache/ms-playwright
+
+# Copy application
 COPY . .
 
-# Healthcheck
 HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
   CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"
 
-# Non-root user for security
 RUN useradd -m appuser
 USER appuser
 
