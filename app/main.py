@@ -1,5 +1,8 @@
 import sys
 import asyncio
+import threading
+import time
+import urllib.request
 
 if sys.platform.startswith("win"):
     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
@@ -18,9 +21,36 @@ structlog.configure(processors=[
     structlog.processors.JSONRenderer()
 ])
 
+# ── Keepalive interno para evitar que o Render durma por inatividade ──
+def _self_ping(base_url: str, stop_event: threading.Event):
+    """Thread que pinga o próprio servidor periodicamente."""
+    health_url = f"{base_url.rstrip('/')}/health"
+    while not stop_event.is_set():
+        try:
+            urllib.request.urlopen(health_url, timeout=10)
+        except Exception:
+            pass
+        # Pinga a cada 10 minutos (antes do timeout de 15 min do Render free tier)
+        stop_event.wait(600)
+
+_ping_stop_event: threading.Event | None = None
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global _ping_stop_event
+    _ping_stop_event = threading.Event()
+    # Usa a mesma porta configurada no settings (default 8000)
+    base_url = f"http://localhost:{settings.PORT}"
+    # Inicia o self-ping em thread separada
+    t = threading.Thread(
+        target=_self_ping,
+        args=(base_url, _ping_stop_event),
+        daemon=True,
+    )
+    t.start()
     yield
+    _ping_stop_event.set()
+    t.join(timeout=5)
     await engine.dispose()
 
 app = FastAPI(title="NFSe Backend", lifespan=lifespan)
