@@ -40,5 +40,9 @@ app.add_middleware(
 async def health():
     return {"status": "healthy"}
 
+@app.head("/health")
+async def health_head():
+    return {"status": "healthy"}
+
 app.include_router(companies_router)
 app.include_router(nfse_router)
