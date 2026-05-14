@@ -1,7 +1,5 @@
 import sys
 import asyncio
-import logging
-import urllib.request
 
 if sys.platform.startswith("win"):
     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
@@ -20,47 +18,12 @@ structlog.configure(processors=[
     structlog.processors.JSONRenderer()
 ])
 
-logger = logging.getLogger("keepalive")
-
-# ── Keepalive interno para evitar que o Render durma por inatividade ──
-async def _self_ping(stop_event: asyncio.Event, base_url: str):
-    """Task async que pinga o próprio servidor periodicamente usando thread pool."""
-    health_url = f"{base_url.rstrip('/')}/health"
-    while not stop_event.is_set():
-        try:
-            # Usa to_thread para não bloquear o event loop
-            await asyncio.to_thread(
-                urllib.request.urlopen, health_url, 10
-            )
-            logger.info("Self-ping OK")
-        except Exception as e:
-            logger.warning(f"Self-ping failed: {e}")
-        # Pinga a cada 5 minutos (antes do timeout de 15 min do Render free tier)
-        try:
-            await asyncio.wait_for(stop_event.wait(), timeout=300)
-            break
-        except asyncio.TimeoutError:
-            pass
-
-_ping_task: asyncio.Task | None = None
-_ping_stop_event: asyncio.Event | None = None
+# Keepalive gerenciado pelo UptimeRobot (https://uptimerobot.com)
+# O self-ping em localhost não conta como tráfego externo no Render free tier.
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _ping_task, _ping_stop_event
-    _ping_stop_event = asyncio.Event()
-    base_url = f"http://127.0.0.1:{settings.PORT}"
-    logger.info(f"Iniciando keepalive self-ping em {base_url}")
-    _ping_task = asyncio.create_task(_self_ping(_ping_stop_event, base_url))
     yield
-    logger.info("Encerrando keepalive...")
-    _ping_stop_event.set()
-    if _ping_task:
-        _ping_task.cancel()
-        try:
-            await _ping_task
-        except asyncio.CancelledError:
-            pass
     await engine.dispose()
 
 app = FastAPI(title="NFSe Backend", lifespan=lifespan)
