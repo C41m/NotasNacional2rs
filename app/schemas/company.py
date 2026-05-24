@@ -5,6 +5,7 @@ from datetime import datetime
 class CompanyBase(BaseModel):
     nome: str = Field(..., max_length=255)
     cnpj: CNPJ
+    id_dominio: int | None = Field(None, description="ID do domínio (opcional)")
 
 class CompanyCreate(CompanyBase):
     pfx_base64: str = Field(..., description="PFX certificate in base64")
@@ -14,6 +15,7 @@ class CompanyUpdate(BaseModel):
     nome: str | None = Field(None, max_length=255)
     pfx_base64: str | None = None
     password: str | None = Field(None, min_length=1)
+    id_dominio: int | None = None
 
 class CompanyOut(CompanyBase):
     id: int

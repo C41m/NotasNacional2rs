@@ -17,7 +17,7 @@ def create_company(company: CompanyCreate, db: Session = Depends(get_db)):
     if existing:
         raise HTTPException(400, "CNPJ already registered")
 
-    db_company = Company(nome=company.nome, cnpj=company.cnpj)
+    db_company = Company(nome=company.nome, cnpj=company.cnpj, id_dominio=company.id_dominio)
     db.add(db_company)
     db.commit()
     db.refresh(db_company)
@@ -56,6 +56,8 @@ def update_company(company_id: int, update: CompanyUpdate, db: Session = Depends
 
     if update.nome:
         company.nome = update.nome
+    if update.id_dominio is not None:
+        company.id_dominio = update.id_dominio
 
     if update.pfx_base64 or update.password:
         if not update.pfx_base64 or not update.password:
