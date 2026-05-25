@@ -1,7 +1,7 @@
 from pydantic import BaseModel, Field, ConfigDict
 from datetime import datetime
 from enum import Enum
-from typing import List
+from typing import List, Literal
 
 class NFSEDownloadRequest(BaseModel):
     company_id: int = Field(..., gt=0)
@@ -31,3 +31,4 @@ class BatchDownloadRequest(BaseModel):
     company_ids: List[int] = Field(..., min_length=1)
     datainicio: str = Field(..., pattern=r"\d{2}/\d{2}/\d{4}")
     datafim: str = Field(..., pattern=r"\d{2}/\d{2}/\d{4}")
+    download_type: Literal["xml", "pdf", "both"] = "xml"

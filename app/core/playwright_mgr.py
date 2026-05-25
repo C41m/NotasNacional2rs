@@ -15,7 +15,7 @@ CHROMIUM_ARGS = [
 ]
 
 CHROMIUM_KWARGS = dict(
-    headless=True,
+    headless=False,
     args=CHROMIUM_ARGS,
 )
 

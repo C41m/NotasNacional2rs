@@ -34,6 +34,7 @@ async def _process_single_company_async(
     batch_id: str,
     batch_status: dict,
     semaphore: asyncio.Semaphore,
+    download_type: str = "xml",
 ):
     """
     Processa download para uma única empresa de forma assíncrona.
@@ -82,6 +83,7 @@ async def _process_single_company_async(
                 browser=browser,
                 datainicio=datainicio,
                 datafim=datafim,
+                download_type=download_type,
                 batch_status=batch_status,
                 batch_id=batch_id,
                 progress_callback=progress_callback,
@@ -100,7 +102,7 @@ async def _process_single_company_async(
             db.close()
 
 
-def process_batch(batch_id: str, company_ids: list, datainicio: str, datafim: str):
+def process_batch(batch_id: str, company_ids: list, datainicio: str, datafim: str, download_type: str = "xml"):
     """
     Processa download para múltiplas empresas.
     - Cada empresa roda em seu próprio processo Chromium dedicado
@@ -151,7 +153,7 @@ def process_batch(batch_id: str, company_ids: list, datainicio: str, datafim: st
                 """Processa uma empresa e atualiza progresso em tempo real."""
                 nonlocal done_count
                 result = await _process_single_company_async(
-                    cid, datainicio, datafim, batch_id, batch_status, semaphore
+                    cid, datainicio, datafim, batch_id, batch_status, semaphore, download_type
                 )
 
                 async with lock:
@@ -245,7 +247,7 @@ def start_batch_download(
 
     batch_id = str(uuid.uuid4())
     background_tasks.add_task(
-        process_batch, batch_id, request.company_ids, request.datainicio, request.datafim,
+        process_batch, batch_id, request.company_ids, request.datainicio, request.datafim, request.download_type,
     )
     return {"batch_id": batch_id, "status": "queued"}
 

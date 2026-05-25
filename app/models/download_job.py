@@ -18,6 +18,7 @@ class DownloadJob(Base):
     notas_processed = Column(Integer, nullable=True, default=0)
     data_inicio = Column(String(10), nullable=True)
     data_fim = Column(String(10), nullable=True)
+    download_type = Column(String(10), nullable=True, default="xml")
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     company = relationship("Company", back_populates="download_jobs")

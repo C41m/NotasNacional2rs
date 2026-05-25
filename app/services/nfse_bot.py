@@ -27,6 +27,7 @@ async def run_nfse_download_async(
     batch_id: str | None = None,
     datainicio: str = "01/04/2026",
     datafim: str = "30/04/2026",
+    download_type: str = "xml",
     progress_callback=None,
 ):
     """Execute NFSe download com mTLS e retry logic, usando o browser dedicado recebido."""
@@ -41,6 +42,7 @@ async def run_nfse_download_async(
         job = db.execute(select(DownloadJob).where(DownloadJob.id == job_id)).scalar_one()
         job.status = "processing"
         job.started_at = datetime.utcnow()
+        job.download_type = download_type
         db.commit()
 
         # Fetch company CNPJ for isolated temp directory
@@ -121,59 +123,99 @@ async def run_nfse_download_async(
                         continue
                     await options_btn.click()
                     try:
+                        # Determina o tipo de download
+                        is_xml = download_type in ("xml", "both")
+                        is_pdf = download_type in ("pdf", "both")
+
+                        # Obtém número da nota
                         xml_link = page.locator("div.popover:visible a:has-text('Download XML')").first
-                        if await xml_link.count() == 0:
-                            continue
-                        await xml_link.wait_for(state="visible", timeout=3000)
-                        href = await xml_link.get_attribute("href")
+                        href = None
                         nf_num = "unknown"
+                        if await xml_link.count() > 0:
+                            href = await xml_link.get_attribute("href")
+                        else:
+                            # Para PDF pode haver só DANFS-e
+                            pdf_link = page.locator("div.popover:visible a:has-text('Download DANFS-e')").first
+                            if await pdf_link.count() == 0:
+                                continue
+                            await pdf_link.wait_for(state="visible", timeout=3000)
+
                         if href:
                             match = re.search(r'/NFSe/(\d+)', href)
                             if match:
                                 nf_num = match.group(1)
 
-                        # Tenta capturar download
-                        download = None
-                        dest_path = None
-                        initial_pages = len(page.context.pages)
+                        # Download XML (se solicitado)
+                        if is_xml:
+                            download = None
+                            dest_path = None
+                            initial_pages = len(page.context.pages)
 
-                        try:
-                            async with page.expect_download() as download_info:
+                            try:
+                                async with page.expect_download() as download_info:
+                                    await xml_link.click()
+                                download = await download_info.value
+                            except Exception:
+                                print("Download XML falhou, tentando via popup")
                                 await xml_link.click()
-                            download = await download_info.value
-                        except Exception:
-                            # expect_download falhou, tenta via popup
-                            print("Download falhou, tentando via popup")
-                            await xml_link.click()
-                            # Aguarda popup ou download
-                            try:
-                                await page.wait_for_selector("div.popover:visible", timeout=2000)
-                            except Exception:
-                                pass
+                                try:
+                                    await page.wait_for_selector("div.popover:visible", timeout=2000)
+                                except Exception:
+                                    pass
 
-                        # Verifica se abriu popup
-                        if download is None and len(page.context.pages) > initial_pages:
-                            popup = page.context.pages[-1]
-                            try:
-                                await popup.wait_for_load_state("networkidle", timeout=3000)
-                                content = await popup.content()
+                            if download is None and len(page.context.pages) > initial_pages:
+                                popup = page.context.pages[-1]
+                                try:
+                                    await popup.wait_for_load_state("networkidle", timeout=3000)
+                                    content = await popup.content()
+                                    dest_path = os.path.join(temp_dir, f"NFSe_{nf_num}.xml")
+                                    with open(dest_path, "w", encoding="utf-8") as f:
+                                        f.write(content)
+                                    await popup.close()
+                                except Exception:
+                                    pass
+
+                            if download and dest_path is None:
                                 dest_path = os.path.join(temp_dir, f"NFSe_{nf_num}.xml")
-                                with open(dest_path, "w", encoding="utf-8") as f:
-                                    f.write(content)
-                                await popup.close()
-                            except Exception:
-                                pass
+                                try:
+                                    await download.save_as(dest_path)
+                                except Exception:
+                                    dest_path = None
 
-                        # Salva download se obtido
-                        if download and dest_path is None:
-                            dest_path = os.path.join(temp_dir, f"NFSe_{nf_num}.xml")
-                            try:
-                                await download.save_as(dest_path)
-                            except Exception:
-                                dest_path = None
+                        # Download PDF/DANFS-e (se solicitado)
+                        if is_pdf:
+                            # Reabre o popover pois pode ter fechado após o download do XML
+                            await options_btn.click()
+                            await page.wait_for_selector("div.popover:visible", timeout=3000)
 
-                        if dest_path and os.path.exists(dest_path):
+                            pdf_link = page.locator("div.popover:visible a:has-text('Download DANFS-e')").first
+                            if await pdf_link.count() > 0:
+                                try:
+                                    await pdf_link.wait_for(state="visible", timeout=3000)
+                                    pdf_download = None
+                                    initial_pages = len(page.context.pages)
+                                    try:
+                                        async with page.expect_download() as download_info:
+                                            await pdf_link.click()
+                                        pdf_download = await download_info.value
+                                    except Exception:
+                                        print("Download PDF falhou, tentando via popup")
+                                        await pdf_link.click()
+
+                                    if pdf_download:
+                                        pdf_path = os.path.join(temp_dir, f"NFSe_{nf_num}.pdf")
+                                        try:
+                                            await pdf_download.save_as(pdf_path)
+                                        except Exception:
+                                            pass
+
+                                except Exception as pdf_err:
+                                    print(f"Erro no download PDF: {pdf_err}")
+
+                        if is_xml or is_pdf:
                             local_count += 1
+                            # Fecha o popover antes da próxima iteração
+                            await page.evaluate("document.querySelectorAll('.popover').forEach(e => e.remove())")
                             if progress_callback:
                                 await progress_callback(company_id, local_count, total_registros or 0)
                     except Exception as e:
