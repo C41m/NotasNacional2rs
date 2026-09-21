@@ -14,3 +14,4 @@ class Company(Base):
 
     certificate = relationship("Certificate", back_populates="company", uselist=False, cascade="all, delete-orphan")
     download_jobs = relationship("DownloadJob", back_populates="company", cascade="all, delete-orphan")
+    documentos_fiscais = relationship("DocumentoFiscal", back_populates="empresa", cascade="all, delete-orphan")

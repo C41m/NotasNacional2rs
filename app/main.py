@@ -11,6 +11,8 @@ from app.core.config import settings
 from app.core.database import engine
 from app.api.routers.companies import router as companies_router
 from app.api.routers.nfse import router as nfse_router
+from app.api.routers.auditoria import router as auditoria_router
+from app.api.routers.documentos import router as documentos_router
 import structlog
 
 structlog.configure(processors=[
@@ -46,3 +48,5 @@ async def health_head():
 
 app.include_router(companies_router)
 app.include_router(nfse_router)
+app.include_router(auditoria_router)
+app.include_router(documentos_router)

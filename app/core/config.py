@@ -6,6 +6,7 @@ class Settings(BaseSettings):
 
     DATABASE_URL: str
     CERT_KEY: str
+    DEEPSEEK_API_KEY: str = ""
     CORS_ORIGINS: Union[str, List[str], None] = None
     PORT: int = 8000
     LOG_LEVEL: str = "INFO"

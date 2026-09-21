@@ -31,3 +31,4 @@ crt/
 .vscode/
 *.swp
 *.swo
+*.tmp
