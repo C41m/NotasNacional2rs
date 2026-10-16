@@ -352,7 +352,7 @@ def download_batch_file(batch_id: str, background_tasks: BackgroundTasks):
 
     def cleanup_after_download():
         import time
-        time.sleep(300)
+        time.sleep(3600)  # 1 hora antes de limpar
         if os.path.exists(zip_path):
             os.remove(zip_path)
         batch_dir = os.path.join(tempfile.gettempdir(), "jobs", batch_id)
