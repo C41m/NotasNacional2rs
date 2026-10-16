@@ -26,7 +26,7 @@ structlog.configure(processors=[
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     yield
-    await engine.dispose()
+    engine.dispose()  # dispose() is synchronous, not async
 
 app = FastAPI(title="NFSe Backend", lifespan=lifespan)
 

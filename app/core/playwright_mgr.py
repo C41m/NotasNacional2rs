@@ -15,7 +15,7 @@ CHROMIUM_ARGS = [
 ]
 
 CHROMIUM_KWARGS = dict(
-    headless=True,
+    headless=False,
     args=CHROMIUM_ARGS,
 )
 
@@ -38,9 +38,11 @@ async def create_mtls_context(
     cert_pem: bytes,
     key_pem: bytes,
     password: Optional[str] = None,
+    origins: Optional[list[str]] = None,
 ) -> Tuple:
     """
     Cria um BrowserContext isolado com certificado mTLS no browser indicado.
+    origins: lista de origens para registrar o exato certificado (ex: ["https://www.nfse.gov.br", "https://certificado.nfse.gov.br"])
     """
     cert_fd, cert_path = tempfile.mkstemp(suffix=".pem")
     key_fd, key_path = tempfile.mkstemp(suffix=".pem")
@@ -51,13 +53,18 @@ async def create_mtls_context(
         with os.fdopen(key_fd, "wb") as f:
             f.write(key_pem)
 
-        context = await browser.new_context(
-            client_certificates=[{
-                "origin": "https://www.nfse.gov.br",
+        # Registra o certificado para todas as origens fornecidas
+        client_certs = []
+        for origin in (origins or ["https://www.nfse.gov.br"]):
+            client_certs.append({
+                "origin": origin,
                 "certPath": cert_path,
                 "keyPath": key_path,
                 **({"passphrase": password} if password else {})
-            }],
+            })
+
+        context = await browser.new_context(
+            client_certificates=client_certs,
             user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             viewport={"width": 1280, "height": 720},
             locale="pt-BR",

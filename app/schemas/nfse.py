@@ -29,6 +29,6 @@ class NFSEDownloadStatus(BaseModel):
 
 class BatchDownloadRequest(BaseModel):
     company_ids: List[int] = Field(..., min_length=1)
-    datainicio: str = Field(..., pattern=r"\d{2}/\d{2}/\d{4}")
-    datafim: str = Field(..., pattern=r"\d{2}/\d{2}/\d{4}")
+    datainicio: str | None = Field(None, pattern=r"\d{2}/\d{2}/\d{4}")
+    datafim: str | None = Field(None, pattern=r"\d{2}/\d{2}/\d{4}")
     download_type: Literal["xml", "pdf", "both"] = "xml"

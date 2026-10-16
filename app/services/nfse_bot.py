@@ -1,15 +1,65 @@
 import re
 import asyncio
-from playwright.async_api import BrowserContext, Download, Browser
+from playwright.async_api import BrowserContext, Download, Browser, TimeoutError as PlaywrightTimeoutError
 from tenacity import retry, stop_after_attempt, wait_exponential
 from app.core.playwright_mgr import create_mtls_context
 from app.models.download_job import DownloadJob
 from app.models.company import Company
 from sqlalchemy.orm import Session
 from sqlalchemy import select
-from typing import List
+from typing import List, Optional
 import tempfile, os, zipfile, shutil
 from datetime import datetime
+
+
+async def handle_captcha_if_present(page, timeout: int = 60) -> bool:
+    """Detecta e tenta resolver CAPTCHA 'Sou humano' se presente.
+    Retorna True se resolveu, False se não havia CAPTCHA."""
+    
+    # Verifica se há alerta de CAPTCHA
+    alert = await page.query_selector("div.alert-info")
+    if not alert:
+        return False
+    
+    text = await alert.inner_text() or ""
+    if "Sou humano" not in text and "desafio" not in text.lower() and "recaptcha" not in text.lower():
+        return False
+    
+    print("[CAPTCHA] Detectado! Tentando resolver...")
+    
+    # Tenta clicar no "Sou humano" (checkbox)
+    human_btn = await page.query_selector("div.alert-info input[type=checkbox], div.alert-info button, div.alert-info a")
+    if human_btn:
+        tag = await human_btn.evaluate("el => el.tagName")
+        # Verifica se é o botão de "Sou humano"
+        btn_text = (await human_btn.inner_text() or "").lower()
+        if "sou humano" in btn_text or "humano" in btn_text or tag == "BUTTON":
+            await human_btn.click()
+            print("[CAPTCHA] Clicou em 'Sou humano'")
+            await page.wait_for_timeout(2000)
+    
+    # Aguarda o alerta desaparecer (resolvido)
+    start = asyncio.get_event_loop().time()
+    while (asyncio.get_event_loop().time() - start) < timeout:
+        try:
+            await page.wait_for_selector("div.alert-info", state="hidden", timeout=1000)
+            print("[CAPTCHA] Resolvido!")
+            return True
+        except:
+            # Ainda está visível, continua aguardando
+            # Clica novamente no botão se aparecer novo
+            new_btn = await page.query_selector("div.alert-info button:not([disabled]), div.alert-info a")
+            if new_btn:
+                await new_btn.click()
+                print("[CAPTCHA] Clicou em botão dentro do alerta")
+            await page.wait_for_timeout(1000)
+    
+    # Timeout - salva screenshot
+    screenshot_path = os.path.join(tempfile.gettempdir(), f"nfse_captcha_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png")
+    await page.screenshot(path=screenshot_path, full_page=True)
+    print(f"[CAPTCHA] Timeout ao resolver. Screenshot salvo em: {screenshot_path}")
+    return False
+
 
 class NFSeBotError(Exception):
     pass
@@ -64,15 +114,30 @@ async def run_nfse_download_async(
 
         # Cria contexto mTLS no browser dedicado (sem contenção com outras tasks)
         context, cert_path, key_path = await create_mtls_context(
-            browser, cert_pem, key_pem, cert_password
+            browser, cert_pem, key_pem, cert_password,
+            origins=[
+                "https://www.nfse.gov.br",
+                "https://certificado.nfse.gov.br",
+            ]
         )
         page = await context.new_page()
 
-        await page.goto("https://www.nfse.gov.br/EmissorNacional/Login?ReturnUrl=%2fEmissorNacional", timeout=30000)
+        await page.goto("https://www.nfse.gov.br/EmissorNacional/", timeout=30000)
         await page.wait_for_selector("a.img-certificado", timeout=30000)
         await page.click("a.img-certificado")
         await page.wait_for_load_state("networkidle", timeout=15000)
+        
+        # Verifica se há CAPTCHA após clicar no certificado
+        captcha_ok = await handle_captcha_if_present(page, timeout=120)
+        if not captcha_ok:
+            print("[CAPTCHA] Não resolvido, tentando continuar mesmo assim...")
+        
         await page.goto("https://www.nfse.gov.br/EmissorNacional/Notas/Emitidas", timeout=30000)
+        
+        # Segunda verificação de CAPTCHA (pode aparecer na página de notas também)
+        captcha_ok2 = await handle_captcha_if_present(page, timeout=120)
+        if not captcha_ok2:
+            print("[CAPTCHA] CAPTCHA persistiu na página de notas")
 
         await page.wait_for_selector("#datainicio", timeout=15000)
         await page.wait_for_selector("#datafim", timeout=15000)
