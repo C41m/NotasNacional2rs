@@ -64,6 +64,7 @@ def update_company(company_id: int, update: CompanyUpdate, db: Session = Depends
             raise HTTPException(400, "Both PFX and password required for certificate update")
         if company.certificate:
             db.delete(company.certificate)
+            db.flush()
         save_certificate(db, company.id, update.pfx_base64, update.password)
 
     db.commit()
