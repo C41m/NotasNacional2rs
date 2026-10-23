@@ -35,6 +35,7 @@ async def _process_single_company_async(
         company = db.execute(select(Company).where(Company.id == company_id)).scalar_one()
         cnpj = company.cnpj
         nome = company.nome
+        id_dominio = company.id_dominio or 0
 
         progress_callback = None
 
@@ -50,27 +51,27 @@ async def _process_single_company_async(
         if result["error"]:
             batch_status[batch_id]["companies"][company_id]["status"] = "failed"
             batch_status[batch_id]["companies"][company_id]["error"] = result["error"]
-            return (company_id, None, result["error"], cnpj, nome, [])
+            return (company_id, None, result["error"], cnpj, nome, id_dominio, xmls)
         elif xmls:
             batch_status[batch_id]["companies"][company_id]["status"] = "success"
-            return (company_id, None, None, cnpj, nome, xmls)
+            return (company_id, None, None, cnpj, nome, id_dominio, xmls)
         else:
             # Sem documentos
             batch_status[batch_id]["companies"][company_id]["status"] = "success"
             batch_status[batch_id]["companies"][company_id]["notas_done"] = 0
-            return (company_id, None, None, cnpj, nome, [])
+            return (company_id, None, None, cnpj, nome, id_dominio, [])
 
     except Exception as e:
-        return (company_id, None, str(e), "", "", [])
+        return (company_id, None, str(e), "", "", 0, [])
     finally:
         db.close()
 
 
-def _organizar_xmls(xmls: list) -> dict:
+def _organizar_xmls_por_competencia_role(xmls: list) -> dict:
     """
-    Organiza XMLs em estrutura: {tipo_documento: {role: {competencia: [xml_data]}}}
-    tipo_documento: 'NFSE', 'EVENTO', 'DPS', 'CREDITO', 'DEBITO', 'APURACAO'
-    role: 'prestado', 'tomado', 'intermediario', 'autor_evento', 'desconhecido'
+    Organiza XMLs na estrutura solicitada:
+    {ano: {mes: {role: [xml_data]}}}
+    role: 'prestado' -> 'Prestados', 'tomado' -> 'Tomados', outros -> 'Outros'
     competencia: 'YYYY-MM'
     """
     organizados = {}
@@ -79,19 +80,34 @@ def _organizar_xmls(xmls: list) -> dict:
         role = xml.get("role", "desconhecido")
         comp = xml.get("competencia", "0000-00")
         
-        # Para eventos, adicionar subtipo
-        if tipo == "EVENTO":
-            evento_desc = xml.get("evento_descricao") or "EVENTO_OUTROS"
-            role = f"evento_{evento_desc.lower()}"
+        # Mapear role para pasta
+        if role == "prestado":
+            pasta_role = "Prestados"
+        elif role == "tomado":
+            pasta_role = "Tomados"
+        else:
+            pasta_role = "Outros"
         
-        if tipo not in organizados:
-            organizados[tipo] = {}
-        if role not in organizados[tipo]:
-            organizados[tipo][role] = {}
-        if comp not in organizados[tipo][role]:
-            organizados[tipo][role][comp] = []
-        organizados[tipo][role][comp].append(xml)
+        # Extrair ano e mês da competência
+        try:
+            ano, mes = comp.split("-")
+        except:
+            ano, mes = "0000", "00"
+        
+        if ano not in organizados:
+            organizados[ano] = {}
+        if mes not in organizados[ano]:
+            organizados[ano][mes] = {}
+        if pasta_role not in organizados[ano][mes]:
+            organizados[ano][mes][pasta_role] = []
+        organizados[ano][mes][pasta_role].append(xml)
     return organizados
+
+
+def _get_empresa_folder_name(id_dominio: int, nome: str) -> str:
+    """Gera nome da pasta da empresa: <Código da Dominio>-<Empresa>"""
+    nome_clean = nome.replace("/", "_").replace("\\", "_").replace(" ", "_")
+    return f"{id_dominio}-{nome_clean}"
 
 
 async def process_batch(batch_id: str, company_ids: list, download_type: str = "xml"):
@@ -119,109 +135,123 @@ async def process_batch(batch_id: str, company_ids: list, download_type: str = "
         }
 
     async def _run_all():
-        errors = []
-        all_company_xmls = []  # [(nome, xml_data)]
+                errors = []
+                all_company_xmls = []  # [(nome, id_dominio, xml_data)]
 
-        # ponytail: loop simples sequencial. Concorrência com create_task/gather
-        # fazia os documentos se perderem entre _process_single_company_async
-        # e o ZIP consolidado. Uma empresa por vez é mais que suficiente.
-        for cid in company_ids:
-            if batch_status[batch_id].get("cancelled"):
-                break
+                # ponytail: loop simples sequencial. Concorrência com create_task/gather
+                # fazia os documentos se perderem entre _process_single_company_async
+                # e o ZIP consolidado. Uma empresa por vez é mais que suficiente.
+                for cid in company_ids:
+                    if batch_status[batch_id].get("cancelled"):
+                        break
 
-            try:
-                result = await _process_single_company_async(
-                    cid, batch_id, batch_status, download_type
-                )
-            except Exception as e:
-                errors.append(str(e))
-                batch_status[batch_id]["companies"][cid]["status"] = "failed"
-                batch_status[batch_id]["companies"][cid]["error"] = str(e)
-                continue
+                    try:
+                        result = await _process_single_company_async(
+                            cid, batch_id, batch_status, download_type
+                        )
+                    except Exception as e:
+                        errors.append(str(e))
+                        batch_status[batch_id]["companies"][cid]["status"] = "failed"
+                        batch_status[batch_id]["companies"][cid]["error"] = str(e)
+                        continue
 
-            batch_status[batch_id]["done"] += 1
-            cid_result, zp, err, cnpj, nome, xmls = result
-            batch_status[batch_id]["companies"][cid]["cnpj"] = cnpj
-            batch_status[batch_id]["companies"][cid]["nome"] = nome
+                    batch_status[batch_id]["done"] += 1
+                    cid_result, zp, err, cnpj, nome, id_dominio, xmls = result
+                    batch_status[batch_id]["companies"][cid]["cnpj"] = cnpj
+                    batch_status[batch_id]["companies"][cid]["nome"] = nome
 
-            if err:
-                errors.append(err)
-                batch_status[batch_id]["companies"][cid]["status"] = "failed"
-                batch_status[batch_id]["companies"][cid]["error"] = err
-            elif xmls:
-                jobs_dir = os.path.join(tempfile.gettempdir(), "jobs", batch_id)
-                os.makedirs(jobs_dir, exist_ok=True)
-                nome_clean = nome.replace("/", "_").replace("\\", "_").replace(" ", "_")
-                zip_path = os.path.join(jobs_dir, f"{nome_clean}.zip")
+                    if err:
+                        errors.append(err)
+                        batch_status[batch_id]["companies"][cid]["status"] = "failed"
+                        batch_status[batch_id]["companies"][cid]["error"] = err
+                    elif xmls:
+                        jobs_dir = os.path.join(tempfile.gettempdir(), "jobs", batch_id)
+                        os.makedirs(jobs_dir, exist_ok=True)
+                        empresa_folder = _get_empresa_folder_name(id_dominio, nome)
+                        zip_path = os.path.join(jobs_dir, f"{empresa_folder}.zip")
 
-                organizados = _organizar_xmls(xmls)
-                with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zipf:
-                    for tipo, roles in organizados.items():
-                        for role, competencias in roles.items():
-                            for comp, xmls_list in competencias.items():
-                                for xml_data in xmls_list:
-                                    nsu = xml_data["nsu"]
-                                    chave = xml_data["chave"]
-                                    xml_str = xml_data["xml"]
-                                    evento_desc = xml_data.get("evento_descricao") or ""
-                                    if evento_desc:
-                                        filename = f"{tipo}/{role}/{comp}/{evento_desc}_NSU{nsu}_{chave}.xml"
-                                    elif chave:
-                                        filename = f"{tipo}/{role}/{comp}/NSU{nsu}_{chave}.xml"
-                                    else:
-                                        filename = f"{tipo}/{role}/{comp}/NSU{nsu}.xml"
-                                    zipf.writestr(filename, xml_str.encode("utf-8"))
+                        organizados = _organizar_xmls_por_competencia_role(xmls)
+                        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zipf:
+                            for ano, meses in organizados.items():
+                                for mes, roles in meses.items():
+                                    for pasta_role, xmls_list in roles.items():
+                                        for xml_data in xmls_list:
+                                            nsu = xml_data["nsu"]
+                                            chave = xml_data["chave"]
+                                            xml_str = xml_data["xml"]
+                                            evento_desc = xml_data.get("evento_descricao") or ""
+                                            if evento_desc:
+                                                filename = f"{empresa_folder}/{ano}/{mes}/{pasta_role}/{evento_desc}_NSU{nsu}_{chave}.xml"
+                                            elif chave:
+                                                filename = f"{empresa_folder}/{ano}/{mes}/{pasta_role}/NSU{nsu}_{chave}.xml"
+                                            else:
+                                                filename = f"{empresa_folder}/{ano}/{mes}/{pasta_role}/NSU{nsu}.xml"
+                                            zipf.writestr(filename, xml_str.encode("utf-8"))
 
-                batch_status[batch_id]["companies"][cid]["status"] = "success"
-                batch_status[batch_id]["companies"][cid]["notas_done"] = len(xmls)
-                batch_status[batch_id]["companies"][cid]["zip_path"] = zip_path
+                        batch_status[batch_id]["companies"][cid]["status"] = "success"
+                        batch_status[batch_id]["companies"][cid]["notas_done"] = len(xmls)
+                        batch_status[batch_id]["companies"][cid]["zip_path"] = zip_path
 
-                for xml_data in xmls:
-                    all_company_xmls.append((nome, xml_data))
+                        for xml_data in xmls:
+                            all_company_xmls.append((nome, id_dominio, xml_data))
 
-                print(f"[Batch {batch_id}] {cid} ({nome}): {len(xmls)} documentos")
-            else:
-                batch_status[batch_id]["companies"][cid]["status"] = "success"
-
-        # ZIP consolidado: NOMEEMPRESA/TIPO_DOCUMENTO/role/competencia/arquivo.xml
-        if all_company_xmls:
-            jobs_dir = os.path.join(tempfile.gettempdir(), "jobs")
-            final_zip = os.path.join(jobs_dir, f"NFSe_ADN_Batch_{batch_id}.zip")
-            
-            with zipfile.ZipFile(final_zip, "w", zipfile.ZIP_DEFLATED) as zipf:
-                for nome, xml_data in all_company_xmls:
-                    nsu = xml_data["nsu"]
-                    tipo = xml_data.get("tipo", "DESCONHECIDO")
-                    chave = xml_data["chave"]
-                    xml_str = xml_data["xml"]
-                    role = xml_data.get("role", "desconhecido")
-                    comp = xml_data.get("competencia", "0000-00")
-                    evento_desc = xml_data.get("evento_descricao") or ""
-                    nome_clean = nome.replace("/", "_").replace("\\", "_").replace(" ", "_")
-                    
-                    if evento_desc:
-                        filename = f"{nome_clean}/{tipo}/{role}/{comp}/{evento_desc}_NSU{nsu}_{chave}.xml"
-                    elif chave:
-                        filename = f"{nome_clean}/{tipo}/{role}/{comp}/NSU{nsu}_{chave}.xml"
+                        print(f"[Batch {batch_id}] {cid} ({nome}): {len(xmls)} documentos")
                     else:
-                        filename = f"{nome_clean}/{tipo}/{role}/{comp}/NSU{nsu}.xml"
-                    zipf.writestr(filename, xml_str.encode("utf-8"))
-            
-            batch_status[batch_id]["zip_path"] = final_zip
-            batch_status[batch_id]["status"] = "success"
-            print(f"[Batch {batch_id}] ZIP consolidado: {len(all_company_xmls)} XMLs → {final_zip}")
-        else:
-            # Sem documentos: cria ZIP vazio para o download funcionar e o
-            # usuário receber um arquivo (resultado correto: nada encontrado).
-            jobs_dir = os.path.join(tempfile.gettempdir(), "jobs")
-            os.makedirs(jobs_dir, exist_ok=True)
-            final_zip = os.path.join(jobs_dir, f"NFSe_ADN_Batch_{batch_id}.zip")
-            with zipfile.ZipFile(final_zip, "w", zipfile.ZIP_DEFLATED):
-                pass
-            batch_status[batch_id]["zip_path"] = final_zip
-            batch_status[batch_id]["status"] = "success"
-            batch_status[batch_id]["error"] = "Nenhum documento encontrado" if not errors else "; ".join(errors)
-            print(f"[Batch {batch_id}] Nenhum documento encontrado → ZIP vazio")
+                        batch_status[batch_id]["companies"][cid]["status"] = "success"
+
+                # ZIP consolidado: <Código da Dominio>-<Empresa>/<Ano>/<Mês>/<Prestados|Tomados|Outros>/arquivo.xml
+                if all_company_xmls:
+                    jobs_dir = os.path.join(tempfile.gettempdir(), "jobs")
+                    final_zip = os.path.join(jobs_dir, f"NFSe_ADN_Batch_{batch_id}.zip")
+
+                    with zipfile.ZipFile(final_zip, "w", zipfile.ZIP_DEFLATED) as zipf:
+                        for nome, id_dominio, xml_data in all_company_xmls:
+                            nsu = xml_data["nsu"]
+                            tipo = xml_data.get("tipo", "DESCONHECIDO")
+                            chave = xml_data["chave"]
+                            xml_str = xml_data["xml"]
+                            role = xml_data.get("role", "desconhecido")
+                            comp = xml_data.get("competencia", "0000-00")
+                            evento_desc = xml_data.get("evento_descricao") or ""
+                            empresa_folder = _get_empresa_folder_name(id_dominio, nome)
+
+                            # Mapear role para pasta
+                            if role == "prestado":
+                                pasta_role = "Prestados"
+                            elif role == "tomado":
+                                pasta_role = "Tomados"
+                            else:
+                                pasta_role = "Outros"
+
+                            # Extrair ano e mês
+                            try:
+                                ano, mes = comp.split("-")
+                            except:
+                                ano, mes = "0000", "00"
+
+                            if evento_desc:
+                                filename = f"{empresa_folder}/{ano}/{mes}/{pasta_role}/{evento_desc}_NSU{nsu}_{chave}.xml"
+                            elif chave:
+                                filename = f"{empresa_folder}/{ano}/{mes}/{pasta_role}/NSU{nsu}_{chave}.xml"
+                            else:
+                                filename = f"{empresa_folder}/{ano}/{mes}/{pasta_role}/NSU{nsu}.xml"
+                            zipf.writestr(filename, xml_str.encode("utf-8"))
+
+                    batch_status[batch_id]["zip_path"] = final_zip
+                    batch_status[batch_id]["status"] = "success"
+                    print(f"[Batch {batch_id}] ZIP consolidado: {len(all_company_xmls)} XMLs → {final_zip}")
+                else:
+                            # Sem documentos: cria ZIP vazio para o download funcionar e o
+                            # usuário receber um arquivo (resultado correto: nada encontrado).
+                            jobs_dir = os.path.join(tempfile.gettempdir(), "jobs")
+                            os.makedirs(jobs_dir, exist_ok=True)
+                            final_zip = os.path.join(jobs_dir, f"NFSe_ADN_Batch_{batch_id}.zip")
+                            with zipfile.ZipFile(final_zip, "w", zipfile.ZIP_DEFLATED):
+                                pass
+                            batch_status[batch_id]["zip_path"] = final_zip
+                            batch_status[batch_id]["status"] = "success"
+                            batch_status[batch_id]["error"] = "Nenhum documento encontrado" if not errors else "; ".join(errors)
+                            print(f"[Batch {batch_id}] Nenhum documento encontrado → ZIP vazio")
 
     try:
         # ponytail: asyncio.run() não pode ser chamado dentro de um loop já ativo.
@@ -399,22 +429,38 @@ def _run_single_sync(job_id: str, company_id: int):
                 )
 
                 with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zipf:
-                    for xml_data in xmls:
-                        nsu = xml_data["nsu"]
-                        tipo = xml_data.get("tipo", "DESCONHECIDO")
-                        chave = xml_data["chave"]
-                        xml_str = xml_data["xml"]
-                        role = xml_data.get("role", "desconhecido")
-                        comp = xml_data.get("competencia", "0000-00")
-                        evento_desc = xml_data.get("evento_descricao") or ""
-                        
-                        if evento_desc:
-                            filename = f"{tipo}/{role}/{comp}/{evento_desc}_NSU{nsu}_{chave}.xml"
-                        elif chave:
-                            filename = f"{tipo}/{role}/{comp}/NSU{nsu}_{chave}.xml"
-                        else:
-                            filename = f"{tipo}/{role}/{comp}/NSU{nsu}.xml"
-                        zipf.writestr(filename, xml_str.encode("utf-8"))
+                                    for xml_data in xmls:
+                                        nsu = xml_data["nsu"]
+                                        tipo = xml_data.get("tipo", "DESCONHECIDO")
+                                        chave = xml_data["chave"]
+                                        xml_str = xml_data["xml"]
+                                        role = xml_data.get("role", "desconhecido")
+                                        comp = xml_data.get("competencia", "0000-00")
+                                        evento_desc = xml_data.get("evento_descricao") or ""
+
+                                        # Mapear role para pasta
+                                        if role == "prestado":
+                                            pasta_role = "Prestados"
+                                        elif role == "tomado":
+                                            pasta_role = "Tomados"
+                                        else:
+                                            pasta_role = "Outros"
+
+                                        # Extrair ano e mês
+                                        try:
+                                            ano, mes = comp.split("-")
+                                        except Exception:
+                                            ano, mes = "0000", "00"
+
+                                        empresa_folder = _get_empresa_folder_name(company.id_dominio, company.nome)
+
+                                        if evento_desc:
+                                            filename = f"{empresa_folder}/{ano}/{mes}/{pasta_role}/{evento_desc}_NSU{nsu}_{chave}.xml"
+                                        elif chave:
+                                            filename = f"{empresa_folder}/{ano}/{mes}/{pasta_role}/NSU{nsu}_{chave}.xml"
+                                        else:
+                                            filename = f"{empresa_folder}/{ano}/{mes}/{pasta_role}/NSU{nsu}.xml"
+                                        zipf.writestr(filename, xml_str.encode("utf-8"))
 
             job = db.execute(select(DownloadJob).where(DownloadJob.id == job_id)).scalar_one_or_none()
             if job:
