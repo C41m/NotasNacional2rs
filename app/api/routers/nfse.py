@@ -861,6 +861,14 @@ async def list_batches(
     return {"batches": list(batch_status.keys())}
 
 
+@router.get("/batch-download/active")
+async def list_active_batches(
+    _api_key: str = Depends(verify_api_key),
+):
+    """Lista todos os batches ativos."""
+    return batch_status
+
+
 @router.get("/batch-download/{batch_id}")
 async def get_batch_status(
     batch_id: str,
@@ -899,14 +907,6 @@ async def cancel_batch(
 
     batch_status[batch_id]["status"] = "cancelling"
     return {"status": "cancelling"}
-
-
-@router.get("/batch-download/active")
-async def list_active_batches(
-    _api_key: str = Depends(verify_api_key),
-):
-    """Lista todos os batches ativos."""
-    return batch_status
 
 
 @router.get("/batch-download/{batch_id}/file")
