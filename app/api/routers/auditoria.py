@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, status, Query
+from fastapi import APIRouter, Depends, HTTPException, status, Query, Response
 from sqlalchemy.orm import Session
 from sqlalchemy import select, func, text
 from sqlalchemy.orm import selectinload
@@ -11,6 +11,7 @@ from app.schemas.auditoria import (
     AuditoriaResumoOut,
     AuditoriaPendenciaOut,
 )
+from app.services.auditoria_xlsx import gerar_xlsx_auditoria
 from typing import List
 
 router = APIRouter(prefix="/auditoria", tags=["auditoria"])
@@ -282,6 +283,68 @@ async def get_fator_r_ranking(db: Session = Depends(get_db), api_key: str = Depe
         }
         for emp in empresas
     ]
+
+
+@router.get("/relatorio/xlsx")
+async def download_relatorio_xlsx(
+    periodo: str = Query(..., description="Período no formato YYYY-MM"),
+    db: Session = Depends(get_db),
+    api_key: str = Depends(api_key_dep),
+):
+    """Gera e retorna planilha XLSX com duas abas: RESUMO e DETALHAMENTO."""
+    # Buscar empresas do período com pendências
+    empresas_result = db.execute(
+        select(Auditoria)
+        .where(Auditoria.periodo == periodo)
+        .options(selectinload(Auditoria.pendencias))
+        .order_by(Auditoria.id)
+    )
+    empresas_db = empresas_result.scalars().all()
+
+    if not empresas_db:
+        raise HTTPException(status_code=404, detail="Nenhuma auditoria encontrada para este período")
+
+    # Preparar dados no formato esperado pelo gerador
+    empresas = []
+    for emp in empresas_db:
+        pendencias = [
+            {
+                "tipo_documento": p.tipo_documento,
+                "gravidade": p.gravidade,
+                "status": p.status,
+                "observacao": p.observacao,
+                "crf": p.crf,
+                "crt": p.crt,
+                "base_calculo": p.base_calculo,
+                "receita_declarada": p.receita_declarada,
+            }
+            for p in emp.pendencias
+        ]
+        criticas_count = sum(1 for p in emp.pendencias if p.gravidade == "ALTA")
+        empresas.append({
+            "id": emp.id,
+            "cnpj": emp.cnpj,
+            "razao_social": emp.razao_social,
+            "periodo": emp.periodo,
+            "status_geral": emp.status_geral,
+            "conformidade_pct": emp.conformidade_pct,
+            "fator_r": emp.fator_r,
+            "aliquota_efetiva": emp.aliquota_efetiva,
+            "classificacao_anexo": emp.classificacao_anexo,
+            "documentos_esperados": emp.documentos_esperados,
+            "documentos_encontrados": emp.documentos_encontrados,
+            "pendencias_criticas_count": criticas_count,
+            "pendencias": pendencias,
+        })
+
+    xlsx_bytes = gerar_xlsx_auditoria(periodo, empresas)
+
+    filename = f"auditoria_{periodo.replace('-', '')}.xlsx"
+    return Response(
+        content=xlsx_bytes,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 def _auditoria_to_out(auditoria: Auditoria) -> AuditoriaOut:

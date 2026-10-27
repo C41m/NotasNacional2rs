@@ -25,26 +25,18 @@ ADN_BASE_URLS = {
 NFSE_NS = "http://www.sped.fazenda.gov.br/nfse"
 
 # Mapeamento de eventos NFS-e Nacional (código → descrição)
+# Fonte: Anexo II - SEFIN ADN (gov.br) - código de 6 dígitos
 MAPEVENTOS = {
     # Eventos de Cancelamento
-    "110110": "SOLICITACAO_CANCELAMENTO",
-    "110111": "CANCELAMENTO",
-    "110112": "CANCELAMENTO_POR_SUBSTITUICAO",
-    "110115": "SUBSTITUICAO",
-    "110116": "ANALISE_FISCAL_CANCELAMENTO",
-    "110117": "ANULACAO_REJEICAO",
-    "110118": "ANALISE_FISCAL_CANCELAMENTO_2",
-    "110119": "CANCELAMENTO_INDEFERIDO",
-    # Eventos de Bloqueio/Desbloqueio
-    "110120": "BLOQUEIO_POR_OFICIO",
-    "110121": "DESBLOQUEIO_POR_OFICIO",
-    "110122": "CANCELAMENTO_POR_OFICIO",
-    "110123": "ANULACAO_CANCELAMENTO_SUBSTITUICAO",
-    # Eventos de Manifestação (Tomador)
-    "101101": "MANIFESTACAO_CONFIRMACAO",
-    "101102": "MANIFESTACAO_REJEICAO",
-    "101103": "MANIFESTACAO_DESCONHECIMENTO",
-    "101104": "MANIFESTACAO_NAO_REALIZADA",
+    "101101": "CANCELAMENTO",  # Cancelamento de NFS-e
+    "105102": "CANCELAMENTO_POR_SUBSTITUICAO",  # Cancelamento de NFS-e por Substituição
+    "105104": "CANCELAMENTO_DEFERIDO_ANALISE_FISCAL",  # Cancelamento Deferido por Análise Fiscal
+    "105105": "CANCELAMENTO_INDEFERIDO_ANALISE_FISCAL",  # Cancelamento Indeferido por Análise Fiscal
+    "305101": "CANCELAMENTO_POR_OFICIO",  # Cancelamento de NFS-e por Ofício (município)
+    # Eventos de Manifestação (Tomador / Prestador / Intermediário)
+    "101102": "MANIFESTACAO_REJEICAO",  # Manifestação de Rejeição
+    "101103": "MANIFESTACAO_DESCONHECIMENTO",  # Manifestação de Desconhecimento
+    "101104": "MANIFESTACAO_NAO_REALIZADA",  # Manifestação Não Realizada
 }
 
 
@@ -187,15 +179,251 @@ def _detectar_role(elem, cnpj_interessado: str, ns) -> str:
 
 def _detectar_role_evento(inf_ped_reg, cnpj_interessado: str, ns) -> str:
     """Detecta o papel do CNPJ interessado em um evento."""
-    cnpj_clean = cnpj_interessado.replace('.', '').replace('/', '').replace('-', '')
-    
+    cnpj_clean = cnpj_interessado.replace(".", "").replace("/", "").replace("-", "")
+
     # Eventos podem ter CNPJ do autor (cnpjAutor ou CPFAutor)
     for path in ['.//nfse:cnpjAutor', './/nfse:CPFAutor']:
         el = inf_ped_reg.find(path, ns)
         if el is not None and el.text == cnpj_clean:
             return 'autor_evento'
-    
+
     return 'desconhecido'
+
+
+# ---------------------------------------------------------------------------
+# Extração de campos de negócio da NFS-e Nacional (leiaute SPED)
+# Mapeia apenas tags reais do XML namespace http://www.sped.fazenda.gov.br/nfse
+# ---------------------------------------------------------------------------
+
+def _texto(elem, path: str, ns) -> Optional[str]:
+    """Retorna o texto de um elemento ou None."""
+    el = elem.find(path, ns)
+    if el is not None and el.text:
+        return el.text.strip()
+    return None
+
+
+def _numero(valor: Optional[str]) -> Optional[float]:
+    """Converte string monetária para float. Retorna None se inválido.
+
+    Suporta:
+    - ponto decimal (XSD): "1500.00" -> 1500.0
+    - vírgula decimal (BR): "1.500,00" -> 1500.0 ; "1500,00" -> 1500.0
+    """
+    if valor is None:
+        return None
+    try:
+        v = valor.strip()
+        if ',' in v:
+            v = v.replace('.', '').replace(',', '.')
+        return float(v)
+    except (ValueError, AttributeError):
+        return None
+
+
+def extrair_campos_nfse(xml_str: str) -> dict:
+    """
+    Extrai campos de negócio de um XML de NFS-e Nacional (infNFSe).
+    Retorna dict com chaves alinhadas ao modelo Nfse / tabela nfse.
+    Não inventa campos: só extrai tags presentes no leiaute SPED.
+    """
+    try:
+        root = ET.fromstring(xml_str)
+        ns = {'nfse': NFSE_NS}
+
+        inf_nfse = root.find('.//nfse:infNFSe', ns)
+        if inf_nfse is None:
+            return {}
+
+        campos: dict = {}
+
+        # Identificação
+        campos['identificador_nfse'] = inf_nfse.get('id')
+        campos['numero_nfse'] = _texto(inf_nfse, './/nfse:nNFSe', ns)
+        campos['versao_leiaute'] = root.get('versao') or inf_nfse.get('versao')
+
+        # Data / competência
+        dh_emi = _texto(inf_nfse, './/nfse:dhEmi', ns)
+        if dh_emi:
+            try:
+                campos['data_emissao'] = datetime.fromisoformat(dh_emi.replace('Z', '+00:00'))
+                campos['competencia'] = dh_emi[:7]  # YYYY-MM
+            except Exception:
+                pass
+        d_compet = _texto(inf_nfse, './/nfse:dCompet', ns)
+        if d_compet and not campos.get('competencia'):
+            try:
+                campos['competencia'] = datetime.strptime(d_compet, '%Y-%m').strftime('%Y-%m')
+            except Exception:
+                campos['competencia'] = d_compet[:7] if len(d_compet) >= 7 else None
+
+        # Município emissor
+        campos['municipio_emissor_codigo'] = _texto(inf_nfse, './/nfse:cLocEmi', ns) or _texto(inf_nfse, './/nfse:cMun', ns)
+        campos['municipio_emissor_descricao'] = _texto(inf_nfse, './/nfse:xLocEmi', ns)
+
+        # Local de prestação e incidência
+        campos['local_prestacao'] = _texto(inf_nfse, './/nfse:xLocPrestacao', ns)
+        campos['local_incidencia_codigo'] = _texto(inf_nfse, './/nfse:cLocIncid', ns)
+        campos['local_incidencia_descricao'] = _texto(inf_nfse, './/nfse:xLocIncid', ns)
+
+        # Tributos
+        campos['tributo_nacional'] = _texto(inf_nfse, './/nfse:xTribNac', ns)
+        campos['tributo_municipal'] = _texto(inf_nfse, './/nfse:xTribMun', ns)
+        campos['codigo_nbs'] = _texto(inf_nfse, './/nfse:xNBS', ns)
+
+        # Identificação administrativa
+        campos['versao_aplicacao'] = _texto(inf_nfse, './/nfse:verAplic', ns)
+        campos['ambiente_gerador'] = _texto(inf_nfse, './/nfse:ambGer', ns)
+        campos['tipo_emissao'] = _texto(inf_nfse, './/nfse:tpEmis', ns)
+        campos['processo_emissao'] = _texto(inf_nfse, './/nfse:procEmi', ns)
+        campos['codigo_status'] = _texto(inf_nfse, './/nfse:cStat', ns)
+        campos['numero_dfse'] = _texto(inf_nfse, './/nfse:nDFSe', ns)
+
+        # Data de processamento
+        dh_proc = _texto(inf_nfse, './/nfse:dhProc', ns)
+        if dh_proc:
+            try:
+                campos['data_processamento'] = datetime.fromisoformat(dh_proc.replace('Z', '+00:00'))
+            except Exception:
+                pass
+
+        # Prestador (emit / prest)
+        prest = inf_nfse.find('.//nfse:emit', ns) or inf_nfse.find('.//nfse:prest', ns)
+        if prest is not None:
+            campos['cnpj_prestador'] = _texto(prest, './/nfse:CNPJ', ns)
+            campos['cpf_prestador'] = _texto(prest, './/nfse:CPF', ns)
+            campos['razao_social_prestador'] = _texto(prest, './/nfse:xNome', ns)
+            campos['inscricao_municipal_prestador'] = _texto(prest, './/nfse:IM', ns)
+            campos['caepf_prestador'] = _texto(prest, './/nfse:CAEPF', ns)
+            campos['nif_prestador'] = _texto(prest, './/nfse:NIF', ns)
+            campos['cnao_nif_prestador'] = _texto(prest, './/nfse:cNaoNIF', ns)
+
+            # Endereço do prestador (enderNac)
+            ender = prest.find('.//nfse:enderNac', ns)
+            if ender is not None:
+                campos['prest_logradouro'] = _texto(ender, './/nfse:xLgr', ns)
+                campos['prest_numero'] = _texto(ender, './/nfse:nro', ns)
+                campos['prest_bairro'] = _texto(ender, './/nfse:xBairro', ns)
+                campos['prest_codigo_municipio'] = _texto(ender, './/nfse:cMun', ns)
+                campos['prest_uf'] = _texto(ender, './/nfse:UF', ns)
+                campos['prest_cep'] = _texto(ender, './/nfse:CEP', ns)
+                campos['prest_telefone'] = _texto(prest, './/nfse:fone', ns)
+                campos['prest_email'] = _texto(prest, './/nfse:email', ns)
+
+        # Tomador
+        toma = inf_nfse.find('.//nfse:toma', ns)
+        if toma is not None:
+            campos['cnpj_tomador'] = _texto(toma, './/nfse:CNPJ', ns)
+            campos['cpf_tomador'] = _texto(toma, './/nfse:CPF', ns)
+            campos['razao_social_tomador'] = _texto(toma, './/nfse:xNome', ns)
+            campos['inscricao_municipal_tomador'] = _texto(toma, './/nfse:IM', ns)
+            campos['caepf_tomador'] = _texto(toma, './/nfse:CAEPF', ns)
+            campos['nif_tomador'] = _texto(toma, './/nfse:NIF', ns)
+            campos['cnao_nif_tomador'] = _texto(toma, './/nfse:cNaoNIF', ns)
+
+        # Serviço
+        serv = inf_nfse.find('.//nfse:serv', ns)
+        if serv is not None:
+            campos['codigo_servico'] = _texto(serv, './/nfse:cServ', ns)
+            info_compl = serv.find('.//nfse:infoCompl', ns)
+            if info_compl is not None:
+                campos['informacoes_complementares'] = _texto(info_compl, './/nfse:xInfComp', ns)
+                campos['numero_pedido'] = _texto(info_compl, './/nfse:xPed', ns)
+
+        # Valores
+        valores = inf_nfse.find('.//nfse:valores', ns)
+        
+        # Função auxiliar para extrair valores de um bloco valores
+        def extrair_valores(valores_elem):
+            if valores_elem is None:
+                return {}
+            v = {}
+            v_serv_prest = valores_elem.find('.//nfse:vServPrest', ns)
+            if v_serv_prest is not None:
+                v['valor_servico'] = _numero(_texto(v_serv_prest, './/nfse:vServ', ns))
+                v['valor_recebido'] = _numero(_texto(v_serv_prest, './/nfse:vReceb', ns))
+            v_desc = valores_elem.find('.//nfse:vDescCondIncond', ns)
+            if v_desc is not None:
+                v['valor_desconto_condicionado'] = _numero(_texto(v_desc, './/nfse:vDescCond', ns))
+                v['valor_desconto_incondicionado'] = _numero(_texto(v_desc, './/nfse:vDescIncond', ns))
+            # Valores diretos do bloco valores/ (conforme leiaute SPED)
+            v['valor_servico'] = _numero(_texto(valores_elem, './/nfse:vServPrest/nfse:vServ', ns)) or v.get('valor_servico')
+            v['valor_recebido'] = _numero(_texto(valores_elem, './/nfse:vServPrest/nfse:vReceb', ns)) or v.get('valor_recebido')
+            v['base_calculo_iss'] = _numero(_texto(valores_elem, './/nfse:vBC', ns))
+            v['aliquota_iss'] = _numero(_texto(valores_elem, './/nfse:pAliqAplic', ns))
+            v['valor_iss'] = _numero(_texto(valores_elem, './/nfse:vISSQN', ns))
+            v['valor_total_retencoes'] = _numero(_texto(valores_elem, './/nfse:vTotalRet', ns))
+            v['valor_liquido_calculado'] = _numero(_texto(valores_elem, './/nfse:vLiq', ns))
+            # Descontos
+            v['valor_desconto_condicionado'] = _numero(_texto(valores_elem, './/nfse:vDescCondIncond/nfse:vDescCond', ns)) or v.get('valor_desconto_condicionado')
+            v['valor_desconto_incondicionado'] = _numero(_texto(valores_elem, './/nfse:vDescCondIncond/nfse:vDescIncond', ns)) or v.get('valor_desconto_incondicionado')
+            # ISS municipal (tribMun) - apenas campos de retenção/tipo
+            trib_mun = valores_elem.find('.//nfse:tribMun', ns)
+            if trib_mun is not None:
+                v['iss_retido'] = _texto(trib_mun, './/nfse:tpRetISSQN', ns)
+                # vRetISSQN pode vir aqui
+                v['valor_iss_retido'] = _numero(_texto(trib_mun, './/nfse:vRetISSQN', ns))
+                # pAliq dentro de tribMun é a alíquota municipal (diferente de pAliqAplic)
+                aliq_trib = _texto(trib_mun, './/nfse:pAliq', ns)
+                if aliq_trib and not v.get('aliquota_iss'):
+                    v['aliquota_iss'] = _numero(aliq_trib)
+            # Retenções federais (tribFed)
+            trib_fed = valores_elem.find('.//nfse:tribFed', ns)
+            if trib_fed is not None:
+                v['valor_retido_cp'] = _numero(_texto(trib_fed, './/nfse:vRetCP', ns))
+                v['valor_retido_irrf'] = _numero(_texto(trib_fed, './/nfse:vRetIRRF', ns))
+                v['valor_retido_csll'] = _numero(_texto(trib_fed, './/nfse:vRetCSLL', ns))
+                v['valor_retido_pis'] = _numero(_texto(trib_fed, './/nfse:vRetPIS', ns))
+                v['valor_retido_cofins'] = _numero(_texto(trib_fed, './/nfse:vRetCOFINS', ns))
+            return v
+
+        # Primeiro tenta valores direto em infNFSe
+        valores_dict = extrair_valores(valores)
+        campos.update(valores_dict)
+        
+        # Se não encontrou valores principais, tenta no DPS/infDPS/valores (para notas tomadas)
+        if not campos.get('valor_servico') or not campos.get('base_calculo_iss'):
+            dps_inf = inf_nfse.find('.//nfse:DPS/nfse:infDPS', ns)
+            if dps_inf is not None:
+                valores_dps = dps_inf.find('.//nfse:valores', ns)
+                if valores_dps is not None:
+                    valores_dps_dict = extrair_valores(valores_dps)
+                    # Só atualiza campos que ainda não têm valor
+                    for k, v in valores_dps_dict.items():
+                        if v is not None and not campos.get(k):
+                            campos[k] = v
+
+        # Chaves de referência
+        # Tenta chNFSe, chaveAcesso, e o Id do infNFSe (formato NFS...)
+        chave_id = inf_nfse.get('id') or inf_nfse.get('Id')
+        if chave_id and chave_id.startswith('NFS'):
+            # Remove prefixo NFS para compatibilidade com dados existentes no banco
+            campos['chave_acesso'] = chave_id[3:]
+        else:
+            campos['chave_acesso'] = _texto(inf_nfse, './/nfse:chNFSe', ns) or _texto(inf_nfse, './/nfse:chaveAcesso', ns)
+        campos['chave_nfe_referenciada'] = _texto(inf_nfse, './/nfse:chaveDFe', ns) or _texto(inf_nfse, './/nfse:chNFe', ns)
+
+        # Valor líquido (cálculo se não vier direto)
+        vs = campos.get('valor_servico')
+        vd_cond = campos.get('valor_desconto_condicionado') or 0
+        vd_incond = campos.get('valor_desconto_incondicionado') or 0
+        if vs is not None:
+            campos['valor_liquido'] = round(vs - vd_cond - vd_incond, 2)
+        else:
+            # Fallback: se não há vServ, usar vLiq como valor_servico para totais
+            v_liq = _texto(valores, './/nfse:vLiq', ns) if valores is not None else None
+            if v_liq:
+                campos['valor_servico'] = _numero(v_liq)
+                campos['valor_liquido'] = _numero(v_liq)
+
+        # XML original
+        campos['xml_original'] = xml_str
+
+        # Remove chaves None para não sobrescrever com None no upsert
+        return {k: v for k, v in campos.items() if v is not None}
+
+    except Exception:
+        return {}
 
 
 async def fetch_distribuicao(

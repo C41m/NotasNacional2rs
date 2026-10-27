@@ -12,6 +12,7 @@ class TipoDocumento(str, Enum):
     DEFIS = "defis"
     DIRF = "dirf"
     EFD_REINF = "efd_reinf"
+    NFSE = "nfse"
 
 
 class DocumentoFiscalBase(BaseModel):
@@ -24,7 +25,7 @@ class DocumentoFiscalBase(BaseModel):
     data_pagamento: Optional[datetime] = None
     numero_documento: Optional[str] = Field(None, max_length=50)
     serie: Optional[str] = Field(None, max_length=10)
-    chave_acesso: Optional[str] = Field(None, max_length=44)
+    chave_acesso: Optional[str] = Field(None, max_length=60)
     situacao: Optional[str] = Field(None, max_length=20)
     valor_total: Optional[float] = None
     observacao: Optional[str] = None
@@ -45,7 +46,7 @@ class DocumentoFiscalUpdate(BaseModel):
     data_pagamento: Optional[datetime] = None
     numero_documento: Optional[str] = Field(None, max_length=50)
     serie: Optional[str] = Field(None, max_length=10)
-    chave_acesso: Optional[str] = Field(None, max_length=44)
+    chave_acesso: Optional[str] = Field(None, max_length=60)
     situacao: Optional[str] = Field(None, max_length=20)
     valor_total: Optional[float] = None
     observacao: Optional[str] = None

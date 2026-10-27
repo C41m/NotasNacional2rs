@@ -16,6 +16,7 @@ from app.models.defis import Defis
 from app.models.dirf import Dirf
 from app.models.efd_reinf import EfdReinf
 from app.models.documento_pendencia import DocumentoPendencia
+from app.models.nfse import Nfse
 
 config = context.config
 config.set_main_option("sqlalchemy.url", settings.DATABASE_URL.replace("+asyncpg", ""))

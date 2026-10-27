@@ -1,6 +1,7 @@
 from sqlalchemy import Column, Integer, String, Float, DateTime, ForeignKey, Enum, Text, Boolean, func
 from sqlalchemy.orm import relationship
 from app.models.base import Base
+from app.models.nfse import Nfse
 import enum
 
 
@@ -12,6 +13,7 @@ class TipoDocumento(enum.Enum):
     DEFIS = "defis"
     DIRF = "dirf"
     EFD_REINF = "efd_reinf"
+    NFSE = "nfse"
 
 
 class DocumentoFiscal(Base):
@@ -27,7 +29,7 @@ class DocumentoFiscal(Base):
     data_pagamento = Column(DateTime, nullable=True)
     numero_documento = Column(String(50), nullable=True)
     serie = Column(String(10), nullable=True)
-    chave_acesso = Column(String(44), nullable=True)
+    chave_acesso = Column(String(60), nullable=True)
     situacao = Column(String(20), nullable=True)
     valor_total = Column(Float, nullable=True)
     observacao = Column(Text, nullable=True)
@@ -43,4 +45,5 @@ class DocumentoFiscal(Base):
     defis = relationship("Defis", back_populates="documento_fiscal", uselist=False)
     dirf = relationship("Dirf", back_populates="documento_fiscal", uselist=False)
     efd_reinf = relationship("EfdReinf", back_populates="documento_fiscal", uselist=False)
+    nfse = relationship("Nfse", back_populates="documento_fiscal", uselist=False)
     pendencias = relationship("DocumentoPendencia", back_populates="documento_fiscal", cascade="all, delete-orphan")
