@@ -150,6 +150,18 @@ async def _process_single_company_async(
         db.close()
 
 
+def _role_to_folder(role: str) -> str:
+    """Mapeia role para nome da pasta principal."""
+    mapping = {
+        "prestado": "Prestados",
+        "tomado": "Tomados",
+        "intermediario": "Intermediarios",
+        "autor_evento": "AutorEvento",
+        "desconhecido": "Desconhecidos",
+    }
+    return mapping.get(role.lower(), "Outros")
+
+
 def _organizar_xmls_por_competencia_role(xmls: list) -> dict:
     """Organiza XMLs na estrutura: {ano: {mes: {role: [xml_data]}}}"""
     organizados = {}
@@ -157,19 +169,14 @@ def _organizar_xmls_por_competencia_role(xmls: list) -> dict:
         tipo = xml.get("tipo", "DESCONHECIDO")
         role = xml.get("role", "desconhecido")
         comp = xml.get("competencia", "0000-00")
-        
-        if role == "prestado":
-            pasta_role = "Prestados"
-        elif role == "tomado":
-            pasta_role = "Tomados"
-        else:
-            pasta_role = "Outros"
-        
+
+        pasta_role = _role_to_folder(role)
+
         try:
             ano, mes = comp.split("-")
         except:
             ano, mes = "0000", "00"
-        
+
         if ano not in organizados:
             organizados[ano] = {}
         if mes not in organizados[ano]:
@@ -726,13 +733,15 @@ def _gerar_zip_batch(batch_id: str, datainicio: str | None, datafim: str | None)
                 ])
             
                 empresa_folder = _get_empresa_folder_name(id_dominio, nome)
-            
+
                 for ano, meses in organizados.items():
                     for mes, roles in meses.items():
                         for role, xmls in roles.items():
                             for i, xml_data in enumerate(xmls):
                                 xml_content = xml_data["xml"]
-                                filename = f"{empresa_folder}/{ano}/{mes}/{role}/NFSe_{xml_data.get('chave', f'{ano}{mes}{i}')}.xml"
+                                # Nova estrutura: <Role>/<Cod.> - <Apelido>/mmaaaa/
+                                mmaaaa = f"{mes}{ano}"
+                                filename = f"{role}/{empresa_folder}/{mmaaaa}/NFSe_{xml_data.get('chave', f'{ano}{mes}{i}')}.xml"
                                 zipf.writestr(filename, xml_content)
             finally:
                 db.close()

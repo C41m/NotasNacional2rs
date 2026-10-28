@@ -19,18 +19,24 @@ def _get_empresa_folder_name(id_dominio: int | None, nome: str) -> str:
     return f"{id_dom}-{nome_clean}"
 
 
+def _role_to_folder(role: str) -> str:
+    """Mapeia role para nome da pasta principal."""
+    mapping = {
+        "prestado": "Prestados",
+        "tomado": "Tomados",
+        "intermediario": "Intermediarios",
+        "autor_evento": "AutorEvento",
+        "desconhecido": "Desconhecidos",
+    }
+    return mapping.get(role.lower(), "Outros")
+
+
 def _organizar_por_competencia_role(competencia: str, role: str) -> tuple[str, str, str]:
     """
     Extrai ano, mês e pasta de role da competência.
-    Retorna (ano, mes, pasta_role) onde pasta_role é 'Prestados', 'Tomados' ou 'Outros'.
+    Retorna (ano, mes, pasta_role) onde pasta_role é o nome da pasta (Prestados, Tomados, etc.).
     """
-    # Mapear role para pasta
-    if role == "prestado":
-        pasta_role = "Prestados"
-    elif role == "tomado":
-        pasta_role = "Tomados"
-    else:
-        pasta_role = "Outros"
+    pasta_role = _role_to_folder(role)
 
     # Extrair ano e mês da competência (formato YYYY-MM)
     try:
@@ -43,19 +49,20 @@ def _organizar_por_competencia_role(competencia: str, role: str) -> tuple[str, s
 
 async def handle_captcha_if_present(page, timeout: int = 60) -> bool:
     """Detecta e tenta resolver CAPTCHA 'Sou humano' se presente.
-    Retorna True se resolveu, False se não havia CAPTCHA."""
-    
+    Retorna True se resolveu, False se não havia CAPTCHA.
+    """
+
     # Verifica se há alerta de CAPTCHA
     alert = await page.query_selector("div.alert-info")
     if not alert:
         return False
-    
+
     text = await alert.inner_text() or ""
     if "Sou humano" not in text and "desafio" not in text.lower() and "recaptcha" not in text.lower():
         return False
-    
+
     print("[CAPTCHA] Detectado! Tentando resolver...")
-    
+
     # Tenta clicar no "Sou humano" (checkbox)
     human_btn = await page.query_selector("div.alert-info input[type=checkbox], div.alert-info button, div.alert-info a")
     if human_btn:
@@ -66,7 +73,7 @@ async def handle_captcha_if_present(page, timeout: int = 60) -> bool:
             await human_btn.click()
             print("[CAPTCHA] Clicou em 'Sou humano'")
             await page.wait_for_timeout(2000)
-    
+
     # Aguarda o alerta desaparecer (resolvido)
     start = asyncio.get_event_loop().time()
     while (asyncio.get_event_loop().time() - start) < timeout:
@@ -82,7 +89,7 @@ async def handle_captcha_if_present(page, timeout: int = 60) -> bool:
                 await new_btn.click()
                 print("[CAPTCHA] Clicou em botão dentro do alerta")
             await page.wait_for_timeout(1000)
-    
+
     # Timeout - salva screenshot
     screenshot_path = os.path.join(tempfile.gettempdir(), f"nfse_captcha_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png")
     await page.screenshot(path=screenshot_path, full_page=True)
@@ -155,14 +162,14 @@ async def run_nfse_download_async(
         await page.wait_for_selector("a.img-certificado", timeout=30000)
         await page.click("a.img-certificado")
         await page.wait_for_load_state("networkidle", timeout=15000)
-        
+
         # Verifica se há CAPTCHA após clicar no certificado
         captcha_ok = await handle_captcha_if_present(page, timeout=120)
         if not captcha_ok:
             print("[CAPTCHA] Não resolvido, tentando continuar mesmo assim...")
-        
+
         await page.goto("https://www.nfse.gov.br/EmissorNacional/Notas/Emitidas", timeout=30000)
-        
+
         # Segunda verificação de CAPTCHA (pode aparecer na página de notas também)
         captcha_ok2 = await handle_captcha_if_present(page, timeout=120)
         if not captcha_ok2:
@@ -208,133 +215,135 @@ async def run_nfse_download_async(
                 num_rows = len(rows)
 
                 for i in range(num_rows):
-                                    await page.evaluate("document.querySelectorAll('.popover').forEach(e => e.remove())")
-                                    row = page.locator("div.container.container-fluid-xl.container-body table tbody tr").nth(i)
-                                    options_btn = row.locator("a.icone-trigger").first
-                                    if await options_btn.count() == 0:
-                                        options_btn = row.locator("td.td-opcoes a").first
-                                    if await options_btn.count() == 0:
-                                        continue
+                    await page.evaluate("document.querySelectorAll('.popover').forEach(e => e.remove())")
+                    row = page.locator("div.container.container-fluid-xl.container-body table tbody tr").nth(i)
+                    options_btn = row.locator("a.icone-trigger").first
+                    if await options_btn.count() == 0:
+                        options_btn = row.locator("td.td-opcoes a").first
+                    if await options_btn.count() == 0:
+                        continue
 
-                                    # Extrai competência da linha (assumindo coluna de competência)
-                                    competencia_row = "0000-00"
+                    # Extrai competência da linha (assumindo coluna de competência)
+                    competencia_row = "0000-00"
+                    try:
+                        # Tenta pegar a competência da coluna correspondente
+                        # Ajuste o seletor conforme a estrutura real da tabela
+                        comp_cell = row.locator("td").nth(2)  # Ajustar índice conforme necessário
+                        comp_text = await comp_cell.inner_text()
+                        if comp_text and re.match(r"\d{2}/\d{4}", comp_text.strip()):
+                            # Converter MM/YYYY para YYYY-MM
+                            mes, ano = comp_text.strip().split("/")
+                            competencia_row = f"{ano}-{mes}"
+                    except Exception:
+                        pass
+
+                    await options_btn.click()
+                    try:
+                        # Determina o tipo de download
+                        is_xml = download_type in ("xml", "both")
+                        is_pdf = download_type in ("pdf", "both")
+
+                        # Obtém número da nota
+                        xml_link = page.locator("div.popover:visible a:has-text('Download XML')").first
+                        href = None
+                        nf_num = "unknown"
+                        if await xml_link.count() > 0:
+                            href = await xml_link.get_attribute("href")
+                        else:
+                            # Para PDF pode haver só DANFS-e
+                            pdf_link = page.locator("div.popover:visible a:has-text('Download DANFS-e')").first
+                            if await pdf_link.count() == 0:
+                                continue
+                            await pdf_link.wait_for(state="visible", timeout=3000)
+
+                        if href:
+                            match = re.search(r'/NFSe/(\d+)', href)
+                            if match:
+                                nf_num = match.group(1)
+
+                        # Prepara pasta estruturada: <Role>/<Cod.> - <Apelido>/mmaaaa/
+                        ano, mes, pasta_role = _organizar_por_competencia_role(competencia_row, "prestado")
+                        empresa_folder = _get_empresa_folder_name(company.id_dominio, company.nome)
+                        # mmaaaa = mês + ano (ex: 042026)
+                        mmaaaa = f"{mes}{ano}"
+                        structured_dir = os.path.join(temp_dir, pasta_role, empresa_folder, mmaaaa)
+                        os.makedirs(structured_dir, exist_ok=True)
+
+                        # Download XML (se solicitado)
+                        if is_xml:
+                            download = None
+                            dest_path = None
+                            initial_pages = len(page.context.pages)
+
+                            try:
+                                async with page.expect_download() as download_info:
+                                    await xml_link.click()
+                                download = await download_info.value
+                            except Exception:
+                                print("Download XML falhou, tentando via popup")
+                                await xml_link.click()
+                                try:
+                                    await page.wait_for_selector("div.popover:visible", timeout=2000)
+                                except Exception:
+                                    pass
+
+                            if download is None and len(page.context.pages) > initial_pages:
+                                popup = page.context.pages[-1]
+                                try:
+                                    await popup.wait_for_load_state("networkidle", timeout=3000)
+                                    content = await popup.content()
+                                    dest_path = os.path.join(structured_dir, f"NFSe_{nf_num}.xml")
+                                    with open(dest_path, "w", encoding="utf-8") as f:
+                                        f.write(content)
+                                    await popup.close()
+                                except Exception:
+                                    pass
+
+                            if download and dest_path is None:
+                                dest_path = os.path.join(structured_dir, f"NFSe_{nf_num}.xml")
+                                try:
+                                    await download.save_as(dest_path)
+                                except Exception:
+                                    dest_path = None
+
+                        # Download PDF/DANFS-e (se solicitado)
+                        if is_pdf:
+                            # Reabre o popover pois pode ter fechado após o download do XML
+                            await options_btn.click()
+                            await page.wait_for_selector("div.popover:visible", timeout=3000)
+
+                            pdf_link = page.locator("div.popover:visible a:has-text('Download DANFS-e')").first
+                            if await pdf_link.count() > 0:
+                                try:
+                                    await pdf_link.wait_for(state="visible", timeout=3000)
+                                    pdf_download = None
+                                    initial_pages = len(page.context.pages)
                                     try:
-                                        # Tenta pegar a competência da coluna correspondente
-                                        # Ajuste o seletor conforme a estrutura real da tabela
-                                        comp_cell = row.locator("td").nth(2)  # Ajustar índice conforme necessário
-                                        comp_text = await comp_cell.inner_text()
-                                        if comp_text and re.match(r"\d{2}/\d{4}", comp_text.strip()):
-                                            # Converter MM/YYYY para YYYY-MM
-                                            mes, ano = comp_text.strip().split("/")
-                                            competencia_row = f"{ano}-{mes}"
+                                        async with page.expect_download() as download_info:
+                                            await pdf_link.click()
+                                        pdf_download = await download_info.value
                                     except Exception:
-                                        pass
+                                        print("Download PDF falhou, tentando via popup")
+                                        await pdf_link.click()
 
-                                    await options_btn.click()
-                                    try:
-                                        # Determina o tipo de download
-                                        is_xml = download_type in ("xml", "both")
-                                        is_pdf = download_type in ("pdf", "both")
+                                    if pdf_download:
+                                        pdf_path = os.path.join(structured_dir, f"NFSe_{nf_num}.pdf")
+                                        try:
+                                            await pdf_download.save_as(pdf_path)
+                                        except Exception:
+                                            pass
 
-                                        # Obtém número da nota
-                                        xml_link = page.locator("div.popover:visible a:has-text('Download XML')").first
-                                        href = None
-                                        nf_num = "unknown"
-                                        if await xml_link.count() > 0:
-                                            href = await xml_link.get_attribute("href")
-                                        else:
-                                            # Para PDF pode haver só DANFS-e
-                                            pdf_link = page.locator("div.popover:visible a:has-text('Download DANFS-e')").first
-                                            if await pdf_link.count() == 0:
-                                                continue
-                                            await pdf_link.wait_for(state="visible", timeout=3000)
+                                except Exception as pdf_err:
+                                    print(f"Erro no download PDF: {pdf_err}")
 
-                                        if href:
-                                            match = re.search(r'/NFSe/(\d+)', href)
-                                            if match:
-                                                nf_num = match.group(1)
-
-                                        # Prepara pasta estruturada: empresa/ano/mes/Prestados/
-                                        ano, mes, pasta_role = _organizar_por_competencia_role(competencia_row, "prestado")
-                                        empresa_folder = _get_empresa_folder_name(company.id_dominio, company.nome)
-                                        structured_dir = os.path.join(temp_dir, empresa_folder, ano, mes, pasta_role)
-                                        os.makedirs(structured_dir, exist_ok=True)
-
-                                        # Download XML (se solicitado)
-                                        if is_xml:
-                                            download = None
-                                            dest_path = None
-                                            initial_pages = len(page.context.pages)
-
-                                            try:
-                                                async with page.expect_download() as download_info:
-                                                    await xml_link.click()
-                                                download = await download_info.value
-                                            except Exception:
-                                                print("Download XML falhou, tentando via popup")
-                                                await xml_link.click()
-                                                try:
-                                                    await page.wait_for_selector("div.popover:visible", timeout=2000)
-                                                except Exception:
-                                                    pass
-
-                                            if download is None and len(page.context.pages) > initial_pages:
-                                                popup = page.context.pages[-1]
-                                                try:
-                                                    await popup.wait_for_load_state("networkidle", timeout=3000)
-                                                    content = await popup.content()
-                                                    dest_path = os.path.join(structured_dir, f"NFSe_{nf_num}.xml")
-                                                    with open(dest_path, "w", encoding="utf-8") as f:
-                                                        f.write(content)
-                                                    await popup.close()
-                                                except Exception:
-                                                    pass
-
-                                            if download and dest_path is None:
-                                                dest_path = os.path.join(structured_dir, f"NFSe_{nf_num}.xml")
-                                                try:
-                                                    await download.save_as(dest_path)
-                                                except Exception:
-                                                    dest_path = None
-
-                                        # Download PDF/DANFS-e (se solicitado)
-                                        if is_pdf:
-                                            # Reabre o popover pois pode ter fechado após o download do XML
-                                            await options_btn.click()
-                                            await page.wait_for_selector("div.popover:visible", timeout=3000)
-
-                                            pdf_link = page.locator("div.popover:visible a:has-text('Download DANFS-e')").first
-                                            if await pdf_link.count() > 0:
-                                                try:
-                                                    await pdf_link.wait_for(state="visible", timeout=3000)
-                                                    pdf_download = None
-                                                    initial_pages = len(page.context.pages)
-                                                    try:
-                                                        async with page.expect_download() as download_info:
-                                                            await pdf_link.click()
-                                                        pdf_download = await download_info.value
-                                                    except Exception:
-                                                        print("Download PDF falhou, tentando via popup")
-                                                        await pdf_link.click()
-
-                                                    if pdf_download:
-                                                        pdf_path = os.path.join(structured_dir, f"NFSe_{nf_num}.pdf")
-                                                        try:
-                                                            await pdf_download.save_as(pdf_path)
-                                                        except Exception:
-                                                            pass
-
-                                                except Exception as pdf_err:
-                                                    print(f"Erro no download PDF: {pdf_err}")
-
-                                        if is_xml or is_pdf:
-                                            local_count += 1
-                                            # Fecha o popover antes da próxima iteração
-                                            await page.evaluate("document.querySelectorAll('.popover').forEach(e => e.remove())")
-                                            if progress_callback:
-                                                await progress_callback(company_id, local_count, total_registros or 0)
-                                    except Exception as e:
-                                        print(f"Erro no download XML: {e}")
+                        if is_xml or is_pdf:
+                            local_count += 1
+                            # Fecha o popover antes da próxima iteração
+                            await page.evaluate("document.querySelectorAll('.popover').forEach(e => e.remove())")
+                            if progress_callback:
+                                await progress_callback(company_id, local_count, total_registros or 0)
+                    except Exception as e:
+                        print(f"Erro no download XML: {e}")
 
                 next_li = page.locator("div.paginacao div.indice ul li").nth(-2)
                 if await next_li.count() > 0:
