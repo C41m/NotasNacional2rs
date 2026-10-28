@@ -14,9 +14,8 @@ from datetime import datetime
 
 def _get_empresa_folder_name(id_dominio: int | None, nome: str) -> str:
     """Gera nome da pasta da empresa: <Código da Dominio>-<Empresa>"""
-    nome_clean = nome.replace("/", "_").replace("\\", "_").replace(" ", "_")
     id_dom = id_dominio or 0
-    return f"{id_dom}-{nome_clean}"
+    return f"{id_dom}-{nome}"
 
 
 def _role_to_folder(role: str) -> str:

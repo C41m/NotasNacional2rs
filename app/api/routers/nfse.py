@@ -189,8 +189,7 @@ def _organizar_xmls_por_competencia_role(xmls: list) -> dict:
 
 def _get_empresa_folder_name(id_dominio: int, nome: str) -> str:
     """Gera nome da pasta da empresa: <Código da Dominio>-<Empresa>"""
-    nome_clean = nome.replace("/", "_").replace("\\", "_").replace(" ", "_")
-    return f"{id_dominio}-{nome_clean}"
+    return f"{id_dominio}-{nome}"
 
 
 def _salvar_notas_empresa(db: Session, empresa_id: int, xmls: list, force_update: bool = False, batch_status: dict = None, batch_id: str = None) -> int:
