@@ -474,7 +474,7 @@ async def fetch_distribuicao(
                     if batch.get("cancelled"):
                         return {"xmls": xmls, "notas_processadas": notas_processadas, "error": "Cancelado"}
 
-                url = f"{base_url}/DFe/{ult_nsu_atual}"
+                url = f"{base_url}/DFe/{ult_nsu_atual}?lote=true&cnpjConsulta={cnpj}"
                 response = await client.get(url)
 
                 if response.status_code == 404:

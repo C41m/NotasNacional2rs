@@ -189,7 +189,8 @@ def _organizar_xmls_por_competencia_role(xmls: list) -> dict:
 
 def _get_empresa_folder_name(id_dominio: int, nome: str) -> str:
     """Gera nome da pasta da empresa: <Código da Dominio>-<Empresa>"""
-    return f"{id_dominio}-{nome}"
+    nome_clean = nome.replace("/", "_").replace("\\", "_").replace(" ", "_")
+    return f"{id_dominio}-{nome_clean}"
 
 
 def _salvar_notas_empresa(db: Session, empresa_id: int, xmls: list, force_update: bool = False, batch_status: dict = None, batch_id: str = None) -> int:
@@ -532,9 +533,15 @@ async def start_batch_download(
             "notasPrestadas": 0,
             "notasTomadas": 0,
             "notasCanceladas": 0,
+            "notasOutros": 0,
             "valorPrestado": 0,
             "valorTomado": 0,
             "valorCancelado": 0,
+            "valorOutros": 0,
+            "notasPrestadasComRetencao": 0,
+            "notasPrestadasSemRetencao": 0,
+            "valorPrestadoComRetencao": 0,
+            "valorPrestadoSemRetencao": 0,
             "carregando_notas": False,
             "cnpj": "",
             "nome": "",
@@ -617,9 +624,15 @@ async def _process_batch_background(
                 notas_prestadas = 0
                 notas_tomadas = 0
                 notas_canceladas = 0
+                notas_outros = 0
                 valor_prestado = 0.0
                 valor_tomado = 0.0
                 valor_cancelado = 0.0
+                valor_outros = 0.0
+                notas_prestadas_com_retencao = 0
+                notas_prestadas_sem_retencao = 0
+                valor_prestado_com_retencao = 0.0
+                valor_prestado_sem_retencao = 0.0
             
                 for xml_data in xmls:
                     campos = extrair_campos_nfse(xml_data["xml"])
@@ -633,6 +646,12 @@ async def _process_batch_background(
                     if role == "prestado":
                         notas_prestadas += 1
                         valor_prestado += vs
+                        if (campos.get("iss_retido") or "") == "1":
+                            notas_prestadas_com_retencao += 1
+                            valor_prestado_com_retencao += vs
+                        else:
+                            notas_prestadas_sem_retencao += 1
+                            valor_prestado_sem_retencao += vs
                     elif role == "tomado":
                         notas_tomadas += 1
                         valor_tomado += vs
@@ -640,17 +659,23 @@ async def _process_batch_background(
                         notas_canceladas += 1
                         valor_cancelado += vs
                     else:
-                        notas_prestadas += 1
-                        valor_prestado += vs
+                        notas_outros += 1
+                        valor_outros += vs
             
                 batch_status[batch_id]["companies"][cid_res]["valorServico"] = valor_servico
                 batch_status[batch_id]["companies"][cid_res]["valorIss"] = valor_iss
                 batch_status[batch_id]["companies"][cid_res]["notasPrestadas"] = notas_prestadas
                 batch_status[batch_id]["companies"][cid_res]["notasTomadas"] = notas_tomadas
                 batch_status[batch_id]["companies"][cid_res]["notasCanceladas"] = notas_canceladas
+                batch_status[batch_id]["companies"][cid_res]["notasOutros"] = notas_outros
                 batch_status[batch_id]["companies"][cid_res]["valorPrestado"] = valor_prestado
                 batch_status[batch_id]["companies"][cid_res]["valorTomado"] = valor_tomado
                 batch_status[batch_id]["companies"][cid_res]["valorCancelado"] = valor_cancelado
+                batch_status[batch_id]["companies"][cid_res]["valorOutros"] = valor_outros
+                batch_status[batch_id]["companies"][cid_res]["notasPrestadasComRetencao"] = notas_prestadas_com_retencao
+                batch_status[batch_id]["companies"][cid_res]["notasPrestadasSemRetencao"] = notas_prestadas_sem_retencao
+                batch_status[batch_id]["companies"][cid_res]["valorPrestadoComRetencao"] = valor_prestado_com_retencao
+                batch_status[batch_id]["companies"][cid_res]["valorPrestadoSemRetencao"] = valor_prestado_sem_retencao
 
                 batch_status[batch_id]["companies"][cid_res]["status"] = "success"
                 batch_status[batch_id]["companies"][cid_res]["mensagem"] = "Concluído com sucesso"
@@ -688,17 +713,17 @@ def _gerar_zip_batch(batch_id: str, datainicio: str | None, datafim: str | None)
         for company_id, company_info in companies_data.items():
             if company_info["status"] != "success":
                 continue
-        
+
             cnpj = company_info.get("cnpj", "")
             nome = company_info.get("nome", "")
             id_dominio = company_info.get("id_dominio", 0)
-        
+
             # Busca XMLs salvos no banco para esta empresa
             db = SessionLocal()
             try:
                 from app.models.documento_fiscal import DocumentoFiscal, TipoDocumento
                 from app.models.nfse import Nfse
-            
+
                 notas_query = (
                     select(Nfse)
                     .join(DocumentoFiscal, Nfse.documento_fiscal_id == DocumentoFiscal.id)
@@ -708,7 +733,7 @@ def _gerar_zip_batch(batch_id: str, datainicio: str | None, datafim: str | None)
                         DocumentoFiscal.ativo == True,
                     )
                 )
-            
+
                 # Filtro de período se fornecido
                 if datainicio or datafim:
                     ini = _para_ym(datainicio)
@@ -717,9 +742,9 @@ def _gerar_zip_batch(batch_id: str, datainicio: str | None, datafim: str | None)
                         notas_query = notas_query.where(Nfse.competencia >= ini)
                     if fim:
                         notas_query = notas_query.where(Nfse.competencia <= fim)
-            
+
                 notas_db = db.execute(notas_query).scalars().all()
-            
+
                 # Organiza por competência e role
                 organizados = _organizar_xmls_por_competencia_role([
                     {
@@ -730,7 +755,7 @@ def _gerar_zip_batch(batch_id: str, datainicio: str | None, datafim: str | None)
                     }
                     for n in notas_db
                 ])
-            
+
                 empresa_folder = _get_empresa_folder_name(id_dominio, nome)
 
                 for ano, meses in organizados.items():
