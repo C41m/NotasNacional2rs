@@ -786,9 +786,6 @@ def _gerar_zip_batch(batch_id: str, datainicio: str | None, datafim: str | None)
                     periodo_inicio = _para_ym(datainicio) if datainicio else None
                     periodo_fim = _para_ym(datafim) if datafim else None
                 
-                    # Se tem período, usa o primeiro; senão busca todas
-                    competencia_filtro = periodo_inicio if periodo_inicio else None
-                
                     notas_query = (
                         select(Nfse)
                         .join(DocumentoFiscal, Nfse.documento_fiscal_id == DocumentoFiscal.id)
@@ -799,8 +796,11 @@ def _gerar_zip_batch(batch_id: str, datainicio: str | None, datafim: str | None)
                         )
                     )
                 
-                    if competencia_filtro:
-                        notas_query = notas_query.where(Nfse.competencia == competencia_filtro)
+                    # Filtra pelo range de competências (consistente com o ZIP de XMLs)
+                    if periodo_inicio:
+                        notas_query = notas_query.where(Nfse.competencia >= periodo_inicio)
+                    if periodo_fim:
+                        notas_query = notas_query.where(Nfse.competencia <= periodo_fim)
                 
                     notas_db = db.execute(notas_query).scalars().all()
                 
@@ -865,9 +865,17 @@ def _gerar_zip_batch(batch_id: str, datainicio: str | None, datafim: str | None)
         
             # Gera XLSX se tem dados
             if empresas_xlsx:
-                periodo_str = datainicio.replace("/", "-")[:7] if datainicio else datetime.now().strftime("%Y-%m")
+                periodo_str = _para_ym(datainicio) if datainicio else datetime.now().strftime("%Y-%m")
+                if not periodo_str:
+                    periodo_str = datetime.now().strftime("%Y-%m")
+                # Se há range, monta rótulo com o range
+                if datainicio and datafim and _para_ym(datainicio) and _para_ym(datafim) and _para_ym(datainicio) != _para_ym(datafim):
+                    periodo_str = f"{_para_ym(datainicio)} a {_para_ym(datafim)}"
+                xlsx_filename_periodo = (periodo_inicio or "TODOS").replace("-", "")
+                if periodo_fim and periodo_fim != periodo_inicio:
+                    xlsx_filename_periodo = f"{xlsx_filename_periodo}_{periodo_fim.replace('-', '')}"
                 xlsx_bytes = gerar_xlsx_nfse_download(periodo_str, empresas_xlsx)
-                zipf.writestr(f"RELATORIO_NFSE_{periodo_str.replace('-', '')}.xlsx", xlsx_bytes)
+                zipf.writestr(f"RELATORIO_NFSE_{xlsx_filename_periodo}.xlsx", xlsx_bytes)
         except Exception as e:
             print(f"Erro ao gerar XLSX para ZIP: {e}")
 
