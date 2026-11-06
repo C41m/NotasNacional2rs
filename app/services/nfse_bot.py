@@ -14,9 +14,8 @@ from datetime import datetime
 
 def _get_empresa_folder_name(id_dominio: int | None, nome: str) -> str:
     """Gera nome da pasta da empresa: <Código da Dominio>-<Empresa>"""
-    nome_clean = nome.replace("/", "_").replace("\\", "_").replace(" ", "_")
     id_dom = id_dominio or 0
-    return f"{id_dom}-{nome_clean}"
+    return f"{id_dom}-{nome}"
 
 
 def _role_to_folder(role: str) -> str:
@@ -186,7 +185,7 @@ async def run_nfse_download_async(
             await page.wait_for_selector("div.paginacao div.descricao", timeout=5000)
             paginacao_text = await page.locator("div.paginacao div.descricao").inner_text()
             print(f"[DEBUG] Paginação text: {paginacao_text}")
-            match = re.search(r'Total de (\\d+) registros', paginacao_text)
+            match = re.search(r'Total de (\d+) registros', paginacao_text)
             if match:
                 total_registros = int(match.group(1))
                 job.total_registros = total_registros
@@ -230,7 +229,7 @@ async def run_nfse_download_async(
                         # Ajuste o seletor conforme a estrutura real da tabela
                         comp_cell = row.locator("td").nth(2)  # Ajustar índice conforme necessário
                         comp_text = await comp_cell.inner_text()
-                        if comp_text and re.match(r"\\d{2}/\\d{4}", comp_text.strip()):
+                        if comp_text and re.match(r"\d{2}/\d{4}", comp_text.strip()):
                             # Converter MM/YYYY para YYYY-MM
                             mes, ano = comp_text.strip().split("/")
                             competencia_row = f"{ano}-{mes}"
@@ -257,7 +256,7 @@ async def run_nfse_download_async(
                             await pdf_link.wait_for(state="visible", timeout=3000)
 
                         if href:
-                            match = re.search(r'/NFSe/(\\d+)', href)
+                            match = re.search(r'/NFSe/(\d+)', href)
                             if match:
                                 nf_num = match.group(1)
 

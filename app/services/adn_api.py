@@ -448,8 +448,9 @@ def extrair_campos_nfse(xml_str: str) -> dict:
         # XML original
         campos['xml_original'] = xml_str
 
-        # Remove chaves None para não sobrescrever com None no upsert
-        return {k: v for k, v in campos.items() if v is not None}
+        # NÃO remover chaves None - o UPSERT precisa de todos os campos (mesmo NULL)
+        # para funcionar corretamente com ON CONFLICT DO UPDATE
+        return campos
 
     except Exception:
         return {}

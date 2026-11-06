@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Query
 from fastapi.responses import FileResponse, StreamingResponse, Response
 from sqlalchemy.orm import Session
-from sqlalchemy import select, insert, func, update
+from sqlalchemy import select, insert, func, update, text
 from typing import List, Optional
 from app.core.database import SessionLocal, get_db
 from app.schemas.nfse import NFSEDownloadRequest, NFSEDownloadResponse, NFSEDownloadStatus, BatchDownloadRequest
@@ -338,16 +338,30 @@ def _salvar_notas_empresa(db: Session, empresa_id: int, xmls: list, force_update
             result = db.execute(stmt.returning(DocumentoFiscal.id, DocumentoFiscal.chave_acesso))
             id_map = {chave: doc_id for doc_id, chave in result.fetchall()}
             
-            # 2. UPSERT Nfse
+            # 2. UPSERT Nfse - usar SQL raw para evitar problemas com None
             for item in lote_nfse_dicts:
                 item["documento_fiscal_id"] = id_map[item["chave_acesso"]]
             
-            stmt_nfse = pg_insert(Nfse).values(lote_nfse_dicts)
-            stmt_nfse = stmt_nfse.on_conflict_do_update(
-                index_elements=["chave_acesso"],
-                set_={k: stmt_nfse.excluded[k] for k in lote_nfse_dicts[0].keys() if k not in ("chave_acesso", "documento_fiscal_id")}
-            )
-            db.execute(stmt_nfse)
+            # Construir UPSERT raw para cada item
+            for item in lote_nfse_dicts:
+                chave = item["chave_acesso"]
+                is_new = chave not in hash_no_banco
+                
+                if is_new:
+                    # INSERT - incluir apenas campos não-None
+                    fields = [k for k, v in item.items() if v is not None]
+                    placeholders = ", ".join([f":{k}" for k in fields])
+                    columns = ", ".join(fields)
+                    sql = f"INSERT INTO nfse ({columns}) VALUES ({placeholders})"
+                    params = {k: v for k, v in item.items() if v is not None}
+                    db.execute(text(sql), params)
+                else:
+                    # UPDATE - apenas campos não-None
+                    update_data = {k: v for k, v in item.items() if v is not None and k not in ("chave_acesso", "documento_fiscal_id")}
+                    if update_data:
+                        set_clause = ", ".join([f"{k} = :{k}" for k in update_data.keys()])
+                        params = {**update_data, "chave_acesso": item["chave_acesso"]}
+                        db.execute(text(f"UPDATE nfse SET {set_clause} WHERE chave_acesso = :chave_acesso"), params)
             
             db.commit()
     
