@@ -127,15 +127,38 @@ def parse_xml_role_and_competence(xml_str: str, cnpj_interessado: str) -> dict:
 
 
 def _extrair_competencia(elem, ns) -> Optional[str]:
-    """Extrai competência de um elemento infNFSe ou infDPS."""
-    for tag in ['nfse:dhEmi', 'nfse:dhProc', 'nfse:dCompet']:
-        found = elem.find(f'.//{tag}', ns)
-        if found is not None and found.text:
-            try:
-                dt = datetime.fromisoformat(found.text.replace('Z', '+00:00'))
-                return dt.strftime('%Y-%m')
-            except:
-                pass
+    """Extrai competência de um elemento infNFSe ou infDPS.
+    
+    Prioridade: dCompet (data competência) > dhEmi (data emissão) > dhProc (data processamento).
+    A competência deve sempre vir de dCompet quando disponível.
+    """
+    # 1. Primeiro tenta dCompet (data de competência - correta para filtros)
+    found = elem.find('.//nfse:dCompet', ns)
+    if found is not None and found.text:
+        try:
+            # dCompet vem como YYYY-MM-DD
+            return found.text[:7]
+        except:
+            pass
+    
+    # 2. Fallback: dhEmi (data de emissão)
+    found = elem.find('.//nfse:dhEmi', ns)
+    if found is not None and found.text:
+        try:
+            dt = datetime.fromisoformat(found.text.replace('Z', '+00:00'))
+            return dt.strftime('%Y-%m')
+        except:
+            pass
+    
+    # 3. Último fallback: dhProc (data de processamento)
+    found = elem.find('.//nfse:dhProc', ns)
+    if found is not None and found.text:
+        try:
+            dt = datetime.fromisoformat(found.text.replace('Z', '+00:00'))
+            return dt.strftime('%Y-%m')
+        except:
+            pass
+    
     return None
 
 
@@ -243,19 +266,25 @@ def extrair_campos_nfse(xml_str: str) -> dict:
         campos['versao_leiaute'] = root.get('versao') or inf_nfse.get('versao')
 
         # Data / competência
+        # dCompet = data de competência (mês de referência do serviço) - É ESTA QUE DEVE SER USADA PARA FILTROS
+        # dhEmi = data de emissão (quando a nota foi emitida)
+        d_compet = _texto(inf_nfse, './/nfse:dCompet', ns)
+        if d_compet:
+            try:
+                # dCompet vem no formato YYYY-MM-DD, extrair YYYY-MM
+                campos['competencia'] = d_compet[:7]
+            except Exception:
+                pass
+        
         dh_emi = _texto(inf_nfse, './/nfse:dhEmi', ns)
         if dh_emi:
             try:
                 campos['data_emissao'] = datetime.fromisoformat(dh_emi.replace('Z', '+00:00'))
-                campos['competencia'] = dh_emi[:7]  # YYYY-MM
+                # Se não tiver dCompet, usa dhEmi como fallback para competência
+                if not campos.get('competencia'):
+                    campos['competencia'] = dh_emi[:7]  # YYYY-MM
             except Exception:
                 pass
-        d_compet = _texto(inf_nfse, './/nfse:dCompet', ns)
-        if d_compet and not campos.get('competencia'):
-            try:
-                campos['competencia'] = datetime.strptime(d_compet, '%Y-%m').strftime('%Y-%m')
-            except Exception:
-                campos['competencia'] = d_compet[:7] if len(d_compet) >= 7 else None
 
         # Município emissor
         campos['municipio_emissor_codigo'] = _texto(inf_nfse, './/nfse:cLocEmi', ns) or _texto(inf_nfse, './/nfse:cMun', ns)

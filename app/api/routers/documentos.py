@@ -36,7 +36,9 @@ async def create_documento(
 async def list_documentos(
     empresa_id: Optional[int] = Query(None, description="Filtrar por empresa"),
     tipo_documento: Optional[TipoDocumento] = Query(None, description="Filtrar por tipo"),
-    periodo: Optional[str] = Query(None, description="Filtrar por período (YYYY-MM)"),
+    periodo: Optional[str] = Query(None, description="Filtrar por competência exata (YYYY-MM)"),
+    competencia_inicio: Optional[str] = Query(None, description="Filtrar por competência início (YYYY-MM)"),
+    competencia_fim: Optional[str] = Query(None, description="Filtrar por competência fim (YYYY-MM)"),
     ano_calendario: Optional[int] = Query(None, description="Filtrar por ano calendário"),
     situacao: Optional[str] = Query(None, description="Filtrar por situação"),
     ativo: Optional[bool] = Query(True, description="Filtrar por status ativo"),
@@ -57,8 +59,14 @@ async def list_documentos(
         filters.append(DocumentoFiscal.empresa_id == empresa_id)
     if tipo_documento is not None:
         filters.append(DocumentoFiscal.tipo_documento == tipo_documento)
+    # Filtro por competência exata (mantém compatibilidade)
     if periodo is not None:
         filters.append(DocumentoFiscal.periodo == periodo)
+    # Filtro por range de competência (novo - preferido para NFSe e docs com competência)
+    if competencia_inicio is not None:
+        filters.append(DocumentoFiscal.periodo >= competencia_inicio)
+    if competencia_fim is not None:
+        filters.append(DocumentoFiscal.periodo <= competencia_fim)
     if ano_calendario is not None:
         filters.append(DocumentoFiscal.ano_calendario == ano_calendario)
     if situacao is not None:
