@@ -743,23 +743,14 @@ def _gerar_zip_batch(batch_id: str, datainicio: str | None, datafim: str | None)
                     periodo_inicio = _para_ym(datainicio) if datainicio else None
                     periodo_fim = _para_ym(datafim) if datafim else None
                 
-                    # Se tem período, usa o primeiro; senão busca todas
-                    competencia_filtro = periodo_inicio if periodo_inicio else None
-                
-                    notas_query = (
-                        select(Nfse)
-                        .join(DocumentoFiscal, Nfse.documento_fiscal_id == DocumentoFiscal.id)
-                        .where(
-                            DocumentoFiscal.empresa_id == company_id,
-                            DocumentoFiscal.tipo_documento == TipoDocumento.NFSE,
-                            DocumentoFiscal.ativo == True,
-                        )
-                    )
-                
-                    if competencia_filtro:
-                        notas_query = notas_query.where(Nfse.competencia == competencia_filtro)
+                    # CORRECAO: usar range periodo inicio a fim (nao so primeiro mes)
+                    if periodo_inicio:
+                        notas_query = notas_query.where(Nfse.competencia >= periodo_inicio)
+                    if periodo_fim:
+                        notas_query = notas_query.where(Nfse.competencia <= periodo_fim)
                 
                     notas_db = db.execute(notas_query).scalars().all()
+                
                 
                     # Mesmo processamento do relatório
                     notas_prestado = 0
@@ -822,7 +813,10 @@ def _gerar_zip_batch(batch_id: str, datainicio: str | None, datafim: str | None)
         
             # Gera XLSX se tem dados
             if empresas_xlsx:
-                periodo_str = datainicio.replace("/", "-")[:7] if datainicio else datetime.now().strftime("%Y-%m")
+                if datainicio and datafim and _para_ym(datainicio) != _para_ym(datafim):
+                    periodo_str = f"{_para_ym(datainicio)}_a_{_para_ym(datafim)}"
+                else:
+                    periodo_str = _para_ym(datainicio) if datainicio else datetime.now().strftime("%Y-%m")
                 xlsx_bytes = gerar_xlsx_nfse_download(periodo_str, empresas_xlsx)
                 zipf.writestr(f"RELATORIO_NFSE_{periodo_str.replace('-', '')}.xlsx", xlsx_bytes)
         except Exception as e:
