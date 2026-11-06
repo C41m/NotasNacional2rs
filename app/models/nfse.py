@@ -105,6 +105,7 @@ class Nfse(Base):
     tipo_documento_api = Column(String(20), nullable=True)       # NFSE / EVENTO / DPS
     role = Column(String(20), nullable=True)                     # prestado / tomado / intermediario
     xml_original = Column(Text, nullable=True)                   # XML completo bruto
+    xml_hash = Column(String(32), nullable=True)                 # SHA256 do XML (para delta detection)
     arquivo_fonte = Column(String(500), nullable=True)           # caminho do arquivo origem
 
     criado_em = Column(DateTime(timezone=True), server_default=func.now())

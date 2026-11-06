@@ -189,17 +189,22 @@ def _organizar_xmls_por_competencia_role(xmls: list) -> dict:
 
 def _get_empresa_folder_name(id_dominio: int, nome: str) -> str:
     """Gera nome da pasta da empresa: <Código da Dominio>-<Empresa>"""
-    nome_clean = nome.replace("/", "_").replace("\\", "_").replace(" ", "_")
-    return f"{id_dominio}-{nome_clean}"
+    return f"{id_dominio}-{nome}"
 
 
 def _salvar_notas_empresa(db: Session, empresa_id: int, xmls: list, force_update: bool = False, batch_status: dict = None, batch_id: str = None) -> int:
-    """Salva XMLs de uma empresa no banco com bulk insert + dedup em memória.
-    Se force_update=True, atualiza registros existentes re-extraindo do XML armazenado.
+    """Salva XMLs de uma empresa no banco com UPSERT + delta detection.
+    
+    Estratégia:
+    - Calcula hash do XML para detectar mudanças
+    - Usa UPSERT (ON CONFLICT) para insert/update atômico
+    - Processa em lotes para não travar o banco
+    - force_update=True re-processa tudo (útil para correção de bugs)
     """
     from app.models.documento_fiscal import DocumentoFiscal, TipoDocumento
     from app.models.nfse import Nfse
     from sqlalchemy import update
+    import hashlib
 
     def _atualiza_msg(msg: str):
         if batch_status and batch_id and batch_id in batch_status:
@@ -207,68 +212,84 @@ def _salvar_notas_empresa(db: Session, empresa_id: int, xmls: list, force_update
             if cid in batch_status[batch_id].get("companies", {}):
                 batch_status[batch_id]["companies"][cid]["mensagem"] = msg
 
-    existentes = db.execute(
-        select(DocumentoFiscal.chave_acesso).where(
-            DocumentoFiscal.empresa_id == empresa_id,
-            DocumentoFiscal.tipo_documento == TipoDocumento.NFSE,
-            DocumentoFiscal.chave_acesso.isnot(None),
-        )
-    ).scalars().all()
-    chaves_existentes = set(existentes)
+    def _xml_hash(xml_str: str) -> str:
+        """Calcula SHA256 do XML normalizado (sem espaços extras)."""
+        normalized = ' '.join(xml_str.split())
+        return hashlib.sha256(normalized.encode()).hexdigest()[:32]
 
+    # Buscar chaves existentes + hash atual no banco (uma query só)
+    _atualiza_msg("Verificando notas existentes...")
+    existentes = db.execute(
+        select(Nfse.chave_acesso, Nfse.xml_hash).where(
+            Nfse.chave_acesso.in_([x.get("chave") or x.get("chave_acesso") for x in xmls if x.get("chave") or x.get("chave_acesso")]),
+        )
+    ).all()
+    
+    # Mapa: chave -> hash_atual_no_banco
+    hash_no_banco = {chave: xml_hash for chave, xml_hash in existentes}
+    
+    # Preparar dados para UPSERT em lote
     doc_dicts: list[dict] = []
-    nfse_items: list[dict] = []
+    nfse_dicts: list[dict] = []
     salvos = 0
     atualizados = 0
-
-    # Se force_update, busca Nfse existentes com xml_original para re-extrair
-    if force_update and chaves_existentes:
-        _atualiza_msg("Buscando notas no banco...")
-        nfse_existentes = db.execute(
-            select(Nfse).where(
-                Nfse.chave_acesso.in_(chaves_existentes),
-                Nfse.xml_original.isnot(None),
-            )
-        ).scalars().all()
-        nfse_por_chave = {n.chave_acesso: n for n in nfse_existentes}
-
-        _atualiza_msg(f"Atualizando {len(nfse_por_chave)} notas...")
-
-        # No force_update, itera diretamente sobre as chaves do banco para garantir atualização de todas
-        for i, chave_temp in enumerate(chaves_existentes, 1):
-            if chave_temp not in nfse_por_chave:
+    ignorados = 0
+    
+    BATCH_SIZE = 100  # Processa em lotes de 100
+    
+    for i in range(0, len(xmls), BATCH_SIZE):
+        lote = xmls[i:i + BATCH_SIZE]
+        _atualiza_msg(f"Processando lote {i//BATCH_SIZE + 1}/{(len(xmls)-1)//BATCH_SIZE + 1}...")
+        
+        lote_doc_dicts = []
+        lote_nfse_dicts = []
+        
+        for xml_data in lote:
+            campos = extrair_campos_nfse(xml_data["xml"])
+            chave = campos.get("chave_acesso") or xml_data.get("chave")
+            
+            if not chave:
                 continue
-            if i % 50 == 0:
-                _atualiza_msg(f"Atualizando {i}/{len(nfse_por_chave)} notas...")
-            xml_para_extrair = nfse_por_chave[chave_temp].xml_original
-            campos = extrair_campos_nfse(xml_para_extrair)
-            chave = campos.get("chave_acesso") or chave_temp
-
-            if chave not in chaves_existentes:
+            
+            # Calcular hash do XML novo
+            xml_str = xml_data["xml"]
+            xml_hash = _xml_hash(xml_str)
+            
+            # Verificar se precisa atualizar
+            hash_antigo = hash_no_banco.get(chave)
+            
+            if hash_antigo == xml_hash and not force_update:
+                # XML idêntico ao salvo - pular
+                ignorados += 1
                 continue
-
-            periodo = campos.get("competencia") or "0000-00"
+            
+            # Precisa inserir ou atualizar
+            periodo = campos.get("competencia") or xml_data.get("competencia") or "0000-00"
             valor_servico = campos.get("valor_servico")
-
-            # Atualiza DocumentoFiscal
-            db.execute(
-                update(DocumentoFiscal)
-                .where(
-                    DocumentoFiscal.empresa_id == empresa_id,
-                    DocumentoFiscal.chave_acesso == chave,
-                )
-                .values(
-                    periodo=periodo,
-                    numero_documento=campos.get("numero_nfse"),
-                    valor_total=valor_servico,
-                    situacao=campos.get("tipo_evento") or "normal",
-                    observacao=campos.get("descricao_evento"),
-                    arquivo_fonte=campos.get("arquivo_fonte"),
-                    data_emissao=campos.get("data_emissao"),
-                )
-            )
-            # Atualiza Nfse
-            nfse_update_data = {"xml_original": xml_para_extrair}
+            
+            lote_doc_dicts.append({
+                "empresa_id": empresa_id,
+                "tipo_documento": TipoDocumento.NFSE,
+                "periodo": periodo,
+                "chave_acesso": chave,
+                "numero_documento": campos.get("numero_nfse"),
+                "valor_total": valor_servico,
+                "situacao": campos.get("tipo_evento") or "normal",
+                "observacao": campos.get("descricao_evento"),
+                "arquivo_fonte": campos.get("arquivo_fonte"),
+                "data_emissao": campos.get("data_emissao"),
+                "ativo": True,
+            })
+            
+            nfse_data = {
+                "chave_acesso": chave,
+                "nsu": xml_data.get("nsu"),
+                "tipo_documento_api": xml_data.get("tipo"),
+                "role": xml_data.get("role"),
+                "competencia": periodo,
+                "xml_original": xml_str,
+                "xml_hash": xml_hash,  # NOVO: armazenar hash para delta detection
+            }
             for campo in [
                 "identificador_nfse", "numero_nfse", "codigo_verificacao", "versao_leiaute",
                 "data_emissao", "municipio_emissor_codigo", "municipio_emissor_descricao",
@@ -286,105 +307,51 @@ def _salvar_notas_empresa(db: Session, empresa_id: int, xmls: list, force_update
                 "arquivo_fonte",
             ]:
                 if campo in campos:
-                    nfse_update_data[campo] = campos[campo]
-
-            db.execute(
-                update(Nfse)
-                .where(Nfse.chave_acesso == chave)
-                .values(**nfse_update_data)
+                    nfse_data[campo] = campos[campo]
+            
+            lote_nfse_dicts.append(nfse_data)
+            
+            if hash_antigo is None:
+                salvos += 1
+            else:
+                atualizados += 1
+        
+        # UPSERT do lote
+        if lote_doc_dicts:
+            # 1. UPSERT DocumentoFiscal
+            from sqlalchemy.dialects.postgresql import insert as pg_insert
+            
+            stmt = pg_insert(DocumentoFiscal).values(lote_doc_dicts)
+            stmt = stmt.on_conflict_do_update(
+                index_elements=["empresa_id", "chave_acesso", "tipo_documento"],
+                set_={
+                    "periodo": stmt.excluded.periodo,
+                    "numero_documento": stmt.excluded.numero_documento,
+                    "valor_total": stmt.excluded.valor_total,
+                    "situacao": stmt.excluded.situacao,
+                    "observacao": stmt.excluded.observacao,
+                    "arquivo_fonte": stmt.excluded.arquivo_fonte,
+                    "data_emissao": stmt.excluded.data_emissao,
+                    "ativo": stmt.excluded.ativo,
+                }
             )
-            atualizados += 1
-
-    _atualiza_msg("Finalizando...")
-
-    if force_update:
-        # No force_update, não processa xmls da ADN - já atualizou tudo acima
-        if not doc_dicts and atualizados == 0:
-            return 0
-        # Commit e retorna
-        if nfse_items:
-            for item in nfse_items:
+            result = db.execute(stmt.returning(DocumentoFiscal.id, DocumentoFiscal.chave_acesso))
+            id_map = {chave: doc_id for doc_id, chave in result.fetchall()}
+            
+            # 2. UPSERT Nfse
+            for item in lote_nfse_dicts:
                 item["documento_fiscal_id"] = id_map[item["chave_acesso"]]
-            db.bulk_save_objects(nfse_items)
-        db.commit()
-        return salvos + atualizados
-
-    for xml_data in xmls:
-        _atualiza_msg("Preparando novas notas...")
-        campos = extrair_campos_nfse(xml_data["xml"])
-        chave = campos.get("chave_acesso") or xml_data.get("chave")
-
-        if not chave:
-            continue
-
-        periodo = campos.get("competencia") or xml_data.get("competencia") or "0000-00"
-        valor_servico = campos.get("valor_servico")
-
-        if chave in chaves_existentes:
-            continue
-
-        doc_dicts.append({
-            "empresa_id": empresa_id,
-            "tipo_documento": TipoDocumento.NFSE,
-            "periodo": periodo,
-            "chave_acesso": chave,
-            "numero_documento": campos.get("numero_nfse"),
-            "valor_total": valor_servico,
-            "situacao": campos.get("tipo_evento") or "normal",
-            "observacao": campos.get("descricao_evento"),
-            "arquivo_fonte": campos.get("arquivo_fonte"),
-            "data_emissao": campos.get("data_emissao"),
-            "ativo": True,
-        })
-
-        nfse_data = {
-            "chave_acesso": chave,
-            "nsu": xml_data.get("nsu"),
-            "tipo_documento_api": xml_data.get("tipo"),
-            "role": xml_data.get("role"),
-            "competencia": periodo,
-            "xml_original": xml_data["xml"],
-        }
-        for campo in [
-            "identificador_nfse", "numero_nfse", "codigo_verificacao", "versao_leiaute",
-            "data_emissao", "municipio_emissor_codigo", "municipio_emissor_descricao",
-            "cnpj_prestador", "cpf_prestador", "razao_social_prestador",
-            "inscricao_municipal_prestador", "caepf_prestador", "nif_prestador", "cnao_nif_prestador",
-            "cnpj_tomador", "cpf_tomador", "razao_social_tomador",
-            "inscricao_municipal_tomador", "caepf_tomador", "nif_tomador", "cnao_nif_tomador",
-            "codigo_servico", "descricao_servico", "informacoes_complementares", "numero_pedido",
-            "valor_servico", "valor_recebido", "valor_desconto_condicionado",
-            "valor_desconto_incondicionado", "valor_liquido", "base_calculo_iss",
-            "aliquota_iss", "valor_iss", "iss_retido", "valor_iss_retido",
-            "valor_retido_cp", "valor_retido_irrf", "valor_retido_csll",
-            "valor_retido_pis", "valor_retido_cofins",
-            "chave_nfe_referenciada", "tipo_evento", "descricao_evento", "data_evento",
-            "arquivo_fonte",
-        ]:
-            if campo in campos:
-                nfse_data[campo] = campos[campo]
-
-        nfse_items.append(nfse_data)
-        chaves_existentes.add(chave)
-        salvos += 1
-
-    if not doc_dicts and atualizados == 0:
-        return 0
-
-    result = db.execute(
-        insert(DocumentoFiscal)
-        .returning(DocumentoFiscal.id, DocumentoFiscal.chave_acesso),
-        doc_dicts,
-    )
-    id_map = {chave: doc_id for doc_id, chave in result.fetchall()}
-
-    nfse_instances = []
-    for item in nfse_items:
-        item["documento_fiscal_id"] = id_map[item["chave_acesso"]]
-        nfse_instances.append(Nfse(**item))
-
-    db.bulk_save_objects(nfse_instances)
-    db.commit()
+            
+            stmt_nfse = pg_insert(Nfse).values(lote_nfse_dicts)
+            stmt_nfse = stmt_nfse.on_conflict_do_update(
+                index_elements=["chave_acesso"],
+                set_={k: stmt_nfse.excluded[k] for k in lote_nfse_dicts[0].keys() if k not in ("chave_acesso", "documento_fiscal_id")}
+            )
+            db.execute(stmt_nfse)
+            
+            db.commit()
+    
+    _atualiza_msg(f"Concluído: {salvos} novas, {atualizados} atualizadas, {ignorados} inalteradas")
     return salvos + atualizados
 
 
@@ -533,15 +500,9 @@ async def start_batch_download(
             "notasPrestadas": 0,
             "notasTomadas": 0,
             "notasCanceladas": 0,
-            "notasOutros": 0,
             "valorPrestado": 0,
             "valorTomado": 0,
             "valorCancelado": 0,
-            "valorOutros": 0,
-            "notasPrestadasComRetencao": 0,
-            "notasPrestadasSemRetencao": 0,
-            "valorPrestadoComRetencao": 0,
-            "valorPrestadoSemRetencao": 0,
             "carregando_notas": False,
             "cnpj": "",
             "nome": "",
@@ -624,15 +585,9 @@ async def _process_batch_background(
                 notas_prestadas = 0
                 notas_tomadas = 0
                 notas_canceladas = 0
-                notas_outros = 0
                 valor_prestado = 0.0
                 valor_tomado = 0.0
                 valor_cancelado = 0.0
-                valor_outros = 0.0
-                notas_prestadas_com_retencao = 0
-                notas_prestadas_sem_retencao = 0
-                valor_prestado_com_retencao = 0.0
-                valor_prestado_sem_retencao = 0.0
             
                 for xml_data in xmls:
                     campos = extrair_campos_nfse(xml_data["xml"])
@@ -646,12 +601,6 @@ async def _process_batch_background(
                     if role == "prestado":
                         notas_prestadas += 1
                         valor_prestado += vs
-                        if (campos.get("iss_retido") or "") == "1":
-                            notas_prestadas_com_retencao += 1
-                            valor_prestado_com_retencao += vs
-                        else:
-                            notas_prestadas_sem_retencao += 1
-                            valor_prestado_sem_retencao += vs
                     elif role == "tomado":
                         notas_tomadas += 1
                         valor_tomado += vs
@@ -659,23 +608,17 @@ async def _process_batch_background(
                         notas_canceladas += 1
                         valor_cancelado += vs
                     else:
-                        notas_outros += 1
-                        valor_outros += vs
+                        notas_prestadas += 1
+                        valor_prestado += vs
             
                 batch_status[batch_id]["companies"][cid_res]["valorServico"] = valor_servico
                 batch_status[batch_id]["companies"][cid_res]["valorIss"] = valor_iss
                 batch_status[batch_id]["companies"][cid_res]["notasPrestadas"] = notas_prestadas
                 batch_status[batch_id]["companies"][cid_res]["notasTomadas"] = notas_tomadas
                 batch_status[batch_id]["companies"][cid_res]["notasCanceladas"] = notas_canceladas
-                batch_status[batch_id]["companies"][cid_res]["notasOutros"] = notas_outros
                 batch_status[batch_id]["companies"][cid_res]["valorPrestado"] = valor_prestado
                 batch_status[batch_id]["companies"][cid_res]["valorTomado"] = valor_tomado
                 batch_status[batch_id]["companies"][cid_res]["valorCancelado"] = valor_cancelado
-                batch_status[batch_id]["companies"][cid_res]["valorOutros"] = valor_outros
-                batch_status[batch_id]["companies"][cid_res]["notasPrestadasComRetencao"] = notas_prestadas_com_retencao
-                batch_status[batch_id]["companies"][cid_res]["notasPrestadasSemRetencao"] = notas_prestadas_sem_retencao
-                batch_status[batch_id]["companies"][cid_res]["valorPrestadoComRetencao"] = valor_prestado_com_retencao
-                batch_status[batch_id]["companies"][cid_res]["valorPrestadoSemRetencao"] = valor_prestado_sem_retencao
 
                 batch_status[batch_id]["companies"][cid_res]["status"] = "success"
                 batch_status[batch_id]["companies"][cid_res]["mensagem"] = "Concluído com sucesso"
@@ -713,17 +656,17 @@ def _gerar_zip_batch(batch_id: str, datainicio: str | None, datafim: str | None)
         for company_id, company_info in companies_data.items():
             if company_info["status"] != "success":
                 continue
-
+        
             cnpj = company_info.get("cnpj", "")
             nome = company_info.get("nome", "")
             id_dominio = company_info.get("id_dominio", 0)
-
+        
             # Busca XMLs salvos no banco para esta empresa
             db = SessionLocal()
             try:
                 from app.models.documento_fiscal import DocumentoFiscal, TipoDocumento
                 from app.models.nfse import Nfse
-
+            
                 notas_query = (
                     select(Nfse)
                     .join(DocumentoFiscal, Nfse.documento_fiscal_id == DocumentoFiscal.id)
@@ -733,7 +676,7 @@ def _gerar_zip_batch(batch_id: str, datainicio: str | None, datafim: str | None)
                         DocumentoFiscal.ativo == True,
                     )
                 )
-
+            
                 # Filtro de período se fornecido
                 if datainicio or datafim:
                     ini = _para_ym(datainicio)
@@ -742,9 +685,9 @@ def _gerar_zip_batch(batch_id: str, datainicio: str | None, datafim: str | None)
                         notas_query = notas_query.where(Nfse.competencia >= ini)
                     if fim:
                         notas_query = notas_query.where(Nfse.competencia <= fim)
-
+            
                 notas_db = db.execute(notas_query).scalars().all()
-
+            
                 # Organiza por competência e role
                 organizados = _organizar_xmls_por_competencia_role([
                     {
@@ -755,7 +698,7 @@ def _gerar_zip_batch(batch_id: str, datainicio: str | None, datafim: str | None)
                     }
                     for n in notas_db
                 ])
-
+            
                 empresa_folder = _get_empresa_folder_name(id_dominio, nome)
 
                 for ano, meses in organizados.items():
@@ -786,6 +729,9 @@ def _gerar_zip_batch(batch_id: str, datainicio: str | None, datafim: str | None)
                     periodo_inicio = _para_ym(datainicio) if datainicio else None
                     periodo_fim = _para_ym(datafim) if datafim else None
                 
+                    # Se tem período, usa o primeiro; senão busca todas
+                    competencia_filtro = periodo_inicio if periodo_inicio else None
+                
                     notas_query = (
                         select(Nfse)
                         .join(DocumentoFiscal, Nfse.documento_fiscal_id == DocumentoFiscal.id)
@@ -796,11 +742,8 @@ def _gerar_zip_batch(batch_id: str, datainicio: str | None, datafim: str | None)
                         )
                     )
                 
-                    # Filtra pelo range de competências (consistente com o ZIP de XMLs)
-                    if periodo_inicio:
-                        notas_query = notas_query.where(Nfse.competencia >= periodo_inicio)
-                    if periodo_fim:
-                        notas_query = notas_query.where(Nfse.competencia <= periodo_fim)
+                    if competencia_filtro:
+                        notas_query = notas_query.where(Nfse.competencia == competencia_filtro)
                 
                     notas_db = db.execute(notas_query).scalars().all()
                 
@@ -865,17 +808,9 @@ def _gerar_zip_batch(batch_id: str, datainicio: str | None, datafim: str | None)
         
             # Gera XLSX se tem dados
             if empresas_xlsx:
-                periodo_str = _para_ym(datainicio) if datainicio else datetime.now().strftime("%Y-%m")
-                if not periodo_str:
-                    periodo_str = datetime.now().strftime("%Y-%m")
-                # Se há range, monta rótulo com o range
-                if datainicio and datafim and _para_ym(datainicio) and _para_ym(datafim) and _para_ym(datainicio) != _para_ym(datafim):
-                    periodo_str = f"{_para_ym(datainicio)} a {_para_ym(datafim)}"
-                xlsx_filename_periodo = (periodo_inicio or "TODOS").replace("-", "")
-                if periodo_fim and periodo_fim != periodo_inicio:
-                    xlsx_filename_periodo = f"{xlsx_filename_periodo}_{periodo_fim.replace('-', '')}"
+                periodo_str = datainicio.replace("/", "-")[:7] if datainicio else datetime.now().strftime("%Y-%m")
                 xlsx_bytes = gerar_xlsx_nfse_download(periodo_str, empresas_xlsx)
-                zipf.writestr(f"RELATORIO_NFSE_{xlsx_filename_periodo}.xlsx", xlsx_bytes)
+                zipf.writestr(f"RELATORIO_NFSE_{periodo_str.replace('-', '')}.xlsx", xlsx_bytes)
         except Exception as e:
             print(f"Erro ao gerar XLSX para ZIP: {e}")
 
