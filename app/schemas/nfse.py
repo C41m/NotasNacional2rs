@@ -29,9 +29,15 @@ class CompanyProgressStatus(BaseModel):
     notasPrestadas: int = 0
     notasTomadas: int = 0
     notasCanceladas: int = 0
+    notasOutros: int = 0
     valorPrestado: float = 0.0
     valorTomado: float = 0.0
     valorCancelado: float = 0.0
+    valorOutros: float = 0.0
+    notasPrestadasComRetencao: int = 0
+    notasPrestadasSemRetencao: int = 0
+    valorPrestadoComRetencao: float = 0.0
+    valorPrestadoSemRetencao: float = 0.0
     carregando_notas: bool = False
     cnpj: str = ""
     nome: str = ""
@@ -52,11 +58,14 @@ class NFSEDownloadStatus(BaseModel):
     started_at: datetime | None = None
     finished_at: datetime | None = None
     created_at: datetime
+    datainicio: str | None = None
+    datafim: str | None = None
+    download_type: str | None = None
     total: int = 0
     done: int = 0
     companies: Dict[str, CompanyProgressStatus] = {}
 
-    model_config = ConfigDict(from_attributes=True)
+    model_config = ConfigDict(from_attributes=True, extra="allow")
 
 
 class BatchDownloadRequest(BaseModel):

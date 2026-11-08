@@ -371,16 +371,34 @@ def _salvar_notas_empresa(db: Session, empresa_id: int, xmls: list, force_update
 
 @router.get("/relatorio/xlsx")
 async def download_relatorio_nfse_xlsx(
-    periodo: str = Query(..., description="Competência no formato YYYY-MM"),
+    periodo: Optional[str] = Query(None, description="Competência exata no formato YYYY-MM (opcional se datainicio/datafim informados)"),
+    datainicio: Optional[str] = Query(None, description="Data inicial DD/MM/YYYY (filtro por competência, inclusivo)"),
+    datafim: Optional[str] = Query(None, description="Data final DD/MM/YYYY (filtro por competência, inclusivo)"),
     company_ids: Optional[str] = Query(None, description="IDs das empresas separados por vírgula (opcional)"),
     db: Session = Depends(get_db),
     api_key: str = Depends(api_key_dep),
 ):
-    """Gera planilha XLSX com notas fiscais baixadas (NFSe) para a competência.
-    
+    """Gera planilha XLSX com notas fiscais baixadas (NFSe).
+
+    Filtro por competência (dCompet extraído do XML), nunca por data de emissão.
+    - Se `periodo` informado: competência exata.
+    - Se `datainicio`/`datafim` informados (DD/MM/YYYY): filtro por range de competência (mesma regra do batch/ZIP).
+    - Caso contrário: 422 (informe ao menos um dos dois).
+
     Aba 1 - RESUMO: Totais por empresa + totais por tipo (Prestado/Tomado/Cancelado) + valores
     Aba 2 - DETALHAMENTO: Todas as notas com detalhes completos
     """
+    if not periodo and not datainicio and not datafim:
+        raise HTTPException(status_code=422, detail="Informe 'periodo' (YYYY-MM) ou 'datainicio'/'datafim' (DD/MM/YYYY)")
+
+    periodo_inicio = _para_ym(datainicio) if datainicio else periodo
+    periodo_fim = _para_ym(datafim) if datafim else periodo
+
+    if periodo_inicio and periodo_fim and periodo_inicio != periodo_fim:
+        periodo_label = f"{periodo_inicio} a {periodo_fim}"
+    else:
+        periodo_label = periodo_inicio or periodo_fim or ""
+
     # Parse company_ids se fornecido
     company_id_list = None
     if company_ids:
@@ -407,11 +425,14 @@ async def download_relatorio_nfse_xlsx(
             .where(
                 DocumentoFiscal.empresa_id == emp.id,
                 DocumentoFiscal.tipo_documento == TipoDocumento.NFSE,
-                Nfse.competencia == periodo,
                 DocumentoFiscal.ativo == True,
             )
             .order_by(Nfse.data_emissao)
         )
+        if periodo_inicio:
+            notas_query = notas_query.where(Nfse.competencia >= periodo_inicio)
+        if periodo_fim:
+            notas_query = notas_query.where(Nfse.competencia <= periodo_fim)
         notas_db = db.execute(notas_query).scalars().all()
 
         # Calcular totais por role
@@ -472,9 +493,9 @@ async def download_relatorio_nfse_xlsx(
             "notas": notas_list,
         })
 
-    xlsx_bytes = gerar_xlsx_nfse_download(periodo, empresas_data)
+    xlsx_bytes = gerar_xlsx_nfse_download(periodo_label, empresas_data)
 
-    filename = f"nfse_download_{periodo.replace('-', '')}.xlsx"
+    filename = f"nfse_download_{periodo_label.replace('-', '').replace(' ', '')}.xlsx"
     return Response(
             content=xlsx_bytes,
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -514,13 +535,20 @@ async def start_batch_download(
             "notasPrestadas": 0,
             "notasTomadas": 0,
             "notasCanceladas": 0,
+            "notasOutros": 0,
             "valorPrestado": 0,
             "valorTomado": 0,
             "valorCancelado": 0,
+            "valorOutros": 0,
+            "notasPrestadasComRetencao": 0,
+            "notasPrestadasSemRetencao": 0,
+            "valorPrestadoComRetencao": 0.0,
+            "valorPrestadoSemRetencao": 0.0,
             "carregando_notas": False,
             "cnpj": "",
             "nome": "",
             "empresa_id": cid,
+            "mensagem": "",
         }
 
     # Adiciona task em background
@@ -599,9 +627,15 @@ async def _process_batch_background(
                 notas_prestadas = 0
                 notas_tomadas = 0
                 notas_canceladas = 0
+                notas_outros = 0
                 valor_prestado = 0.0
                 valor_tomado = 0.0
                 valor_cancelado = 0.0
+                valor_outros = 0.0
+                notas_prestadas_com_retencao = 0
+                notas_prestadas_sem_retencao = 0
+                valor_prestado_com_retencao = 0.0
+                valor_prestado_sem_retencao = 0.0
             
                 for xml_data in xmls:
                     campos = extrair_campos_nfse(xml_data["xml"])
@@ -612,27 +646,39 @@ async def _process_batch_background(
                     valor_iss += float(campos.get("valor_iss") or 0)
                 
                     role = (xml_data.get("role") or "").lower()
-                    if role == "prestado":
+                    if campos.get("tipo_evento"):
+                        notas_canceladas += 1
+                        valor_cancelado += vs
+                    elif role == "prestado":
                         notas_prestadas += 1
                         valor_prestado += vs
+                        if (campos.get("iss_retido") or "") == "1" or float(campos.get("valor_iss_retido") or 0) > 0:
+                            notas_prestadas_com_retencao += 1
+                            valor_prestado_com_retencao += vs
+                        else:
+                            notas_prestadas_sem_retencao += 1
+                            valor_prestado_sem_retencao += vs
                     elif role == "tomado":
                         notas_tomadas += 1
                         valor_tomado += vs
-                    elif campos.get("tipo_evento"):
-                        notas_canceladas += 1
-                        valor_cancelado += vs
                     else:
-                        notas_prestadas += 1
-                        valor_prestado += vs
+                        notas_outros += 1
+                        valor_outros += vs
             
                 batch_status[batch_id]["companies"][cid_res]["valorServico"] = valor_servico
                 batch_status[batch_id]["companies"][cid_res]["valorIss"] = valor_iss
                 batch_status[batch_id]["companies"][cid_res]["notasPrestadas"] = notas_prestadas
                 batch_status[batch_id]["companies"][cid_res]["notasTomadas"] = notas_tomadas
                 batch_status[batch_id]["companies"][cid_res]["notasCanceladas"] = notas_canceladas
+                batch_status[batch_id]["companies"][cid_res]["notasOutros"] = notas_outros
                 batch_status[batch_id]["companies"][cid_res]["valorPrestado"] = valor_prestado
                 batch_status[batch_id]["companies"][cid_res]["valorTomado"] = valor_tomado
                 batch_status[batch_id]["companies"][cid_res]["valorCancelado"] = valor_cancelado
+                batch_status[batch_id]["companies"][cid_res]["valorOutros"] = valor_outros
+                batch_status[batch_id]["companies"][cid_res]["notasPrestadasComRetencao"] = notas_prestadas_com_retencao
+                batch_status[batch_id]["companies"][cid_res]["notasPrestadasSemRetencao"] = notas_prestadas_sem_retencao
+                batch_status[batch_id]["companies"][cid_res]["valorPrestadoComRetencao"] = valor_prestado_com_retencao
+                batch_status[batch_id]["companies"][cid_res]["valorPrestadoSemRetencao"] = valor_prestado_sem_retencao
 
                 batch_status[batch_id]["companies"][cid_res]["status"] = "success"
                 batch_status[batch_id]["companies"][cid_res]["mensagem"] = "Concluído com sucesso"
@@ -871,6 +917,9 @@ async def get_batch_status(
             started_at=datetime.fromisoformat(s["created_at"]) if s.get("created_at") else None,
             finished_at=datetime.now() if s["status"] in ("success", "failed", "cancelled") else None,
             created_at=datetime.fromisoformat(s["created_at"]) if s.get("created_at") else None,
+            datainicio=s.get("datainicio"),
+            datafim=s.get("datafim"),
+            download_type=s.get("download_type"),
             total=s.get("total", 0),
             done=s.get("done", 0),
             companies=s.get("companies", {}),
