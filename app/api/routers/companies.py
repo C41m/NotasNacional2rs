@@ -32,7 +32,7 @@ def create_company(company: CompanyCreate, db: Session = Depends(get_db)):
 
 @router.get("/", response_model=List[CompanyOut])
 def list_companies(page: int = 1, limit: int = 20, search: str = "", db: Session = Depends(get_db)):
-    query = select(Company).options(selectinload(Company.certificate))
+    query = select(Company).options(selectinload(Company.certificate)).order_by(Company.id)
     if search:
         query = query.where(Company.nome.icontains(search) | Company.cnpj.icontains(search))
     result = db.execute(query.offset((page-1)*limit).limit(limit))

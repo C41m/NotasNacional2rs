@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Query
 from fastapi.responses import FileResponse, StreamingResponse, Response
 from sqlalchemy.orm import Session
-from sqlalchemy import select, insert, func, update, text
+from sqlalchemy import select, insert, func, update, text, or_
 from typing import List, Optional
 from app.core.database import SessionLocal, get_db
 from app.schemas.nfse import NFSEDownloadRequest, NFSEDownloadResponse, NFSEDownloadStatus, BatchDownloadRequest
@@ -9,8 +9,23 @@ from app.models.download_job import DownloadJob
 from app.models.company import Company
 from app.models.documento_fiscal import DocumentoFiscal, TipoDocumento
 from app.models.nfse import Nfse
-from app.schemas.nfse_detail import NfseSalvarRequest, NfseOut
-from app.services.adn_api import fetch_distribuicao, extrair_campos_nfse
+from app.schemas.common import PaginatedResponse
+from app.schemas.nfse_detail import (
+    NfseSalvarRequest,
+    NfseOut,
+    NotaResumoOut,
+    NotaDetalheOut,
+    DashboardResumoOut,
+    DashboardSerieItem,
+    DashboardEmpresaItem,
+)
+from app.services.adn_api import (
+    fetch_distribuicao,
+    extrair_campos_nfse,
+    parse_xml_role_and_competence,
+    EVENTO_CANCELAMENTO,
+    situacao_para_evento,
+)
 from app.services.nfse_xlsx import gerar_xlsx_nfse_download
 from app.core.api_key import verify_api_key, api_key_dep
 import uuid
@@ -192,6 +207,146 @@ def _get_empresa_folder_name(id_dominio: int, nome: str) -> str:
     return f"{id_dominio}-{nome}"
 
 
+def _marcar_notas_canceladas(db: Session, empresa_id: int, eventos: list[dict]) -> int:
+    """Marca a NFS-e original como cancelada para cada evento coletado neste lote.
+
+    O evento referencia a nota pela mesma chave (chNFSe == chave_acesso da nota).
+    Não cria documento nem nota: apenas atualiza situacao/observacao no DocumentoFiscal
+    e tipo_evento/descricao_evento/data_evento no nfse.
+    """
+    marcados = 0
+    for ev in eventos:
+        chave_ref = ev.get("chave_ref")
+        tipo_evento = ev.get("tipo_evento")
+        if not chave_ref or not tipo_evento:
+            continue
+        if situacao_para_evento(tipo_evento) == "normal":
+            continue
+        descricao = ev.get("descricao")
+        data_evento = ev.get("data_evento")
+        doc = db.execute(
+            select(DocumentoFiscal).where(
+                DocumentoFiscal.empresa_id == empresa_id,
+                DocumentoFiscal.chave_acesso == chave_ref,
+                DocumentoFiscal.ativo == True,
+            )
+        ).scalars().first()
+        if not doc:
+            print(f"[ADN] Evento {tipo_evento} sem nota original para a chave {chave_ref} (empresa {empresa_id})")
+            continue
+        doc.situacao = situacao_para_evento(tipo_evento)
+        doc.observacao = descricao
+        nfse_row = db.execute(
+            select(Nfse).where(Nfse.documento_fiscal_id == doc.id)
+        ).scalars().first()
+        if nfse_row:
+            nfse_row.tipo_evento = tipo_evento
+            nfse_row.descricao_evento = descricao
+            nfse_row.data_evento = data_evento
+        marcados += 1
+    db.commit()
+    return marcados
+
+
+def _parse_data_evento(valor) -> "datetime | None":
+    """Converte dhEvento/dhRegEvento (ISO) para datetime. Retorna None se inválido/ausente."""
+    if not valor:
+        return None
+    try:
+        return datetime.fromisoformat(str(valor).replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+def _reconciliar_eventos_cancelamento(db: Session, empresa_id: int) -> int:
+    """Marca a nota original como cancelada para cada EVENTO conhecido no banco.
+
+    Um evento referencia a NFSe cancelada via <chNFSe>. Este passo:
+    1. Re-extrai metadados de EVENTOS antigos salvos antes das correções (que ficaram
+       sem tipo_evento/chNFSe), usando o xml_original;
+    2. Atualiza o próprio documento do EVENTO (situacao 'cancelada');
+    3. Atualiza a nota original referenciada (situacao/observacao no DocumentoFiscal e
+       tipo_evento/descricao_evento/data_evento no nfse), para que os relatórios a contem
+       como cancelada.
+
+    Retorna o número de notas originais marcadas.
+    """
+    eventos = db.execute(
+        select(Nfse.id, Nfse.tipo_evento, Nfse.descricao_evento, Nfse.data_evento,
+               Nfse.chave_nfe_referenciada, Nfse.xml_original)
+        .join(DocumentoFiscal, Nfse.documento_fiscal_id == DocumentoFiscal.id)
+        .where(
+            DocumentoFiscal.empresa_id == empresa_id,
+            Nfse.tipo_documento_api == "EVENTO",
+        )
+    ).all()
+    if not eventos:
+        return 0
+
+    marcados = 0
+    for ev in eventos:
+        chave_ref = ev.chave_nfe_referenciada
+        tipo_evento = ev.tipo_evento
+        descricao = ev.descricao_evento
+        data_evento = ev.data_evento
+
+        # Re-extrair do XML eventos salvos antes das correções (sem metadados persistidos)
+        if (not tipo_evento or not chave_ref) and ev.xml_original:
+            info = parse_xml_role_and_competence(ev.xml_original, "")
+            tipo_evento = tipo_evento or info.get("evento_tipo")
+            descricao = descricao or info.get("evento_descricao")
+            chave_ref = chave_ref or info.get("chave_referenciada")
+            data_evento = data_evento or _parse_data_evento(info.get("data_evento"))
+            if tipo_evento:
+                situacao_evento = situacao_para_evento(tipo_evento)
+                db.execute(
+                    update(Nfse).where(Nfse.id == ev.id).values(
+                        tipo_evento=tipo_evento,
+                        descricao_evento=descricao,
+                        data_evento=data_evento,
+                        chave_nfe_referenciada=chave_ref,
+                    )
+                )
+                doc_evento_id = db.execute(
+                    select(Nfse.documento_fiscal_id).where(Nfse.id == ev.id)
+                ).scalar_one_or_none()
+                if doc_evento_id:
+                    db.execute(
+                        update(DocumentoFiscal)
+                        .where(DocumentoFiscal.id == doc_evento_id)
+                        .values(situacao=situacao_evento, observacao=descricao)
+                    )
+
+        if not chave_ref or not tipo_evento:
+            continue
+        if situacao_para_evento(tipo_evento) == "normal":
+            continue
+
+        doc = db.execute(
+            select(DocumentoFiscal).where(
+                DocumentoFiscal.empresa_id == empresa_id,
+                DocumentoFiscal.chave_acesso == chave_ref,
+                DocumentoFiscal.ativo == True,
+            )
+        ).scalars().first()
+        if not doc:
+            continue
+        doc.situacao = situacao_para_evento(tipo_evento)
+        if descricao:
+            doc.observacao = descricao
+        nfse_row = db.execute(
+            select(Nfse).where(Nfse.documento_fiscal_id == doc.id)
+        ).scalars().first()
+        if nfse_row:
+            nfse_row.tipo_evento = tipo_evento
+            nfse_row.descricao_evento = descricao
+            nfse_row.data_evento = data_evento
+        marcados += 1
+
+    db.commit()
+    return marcados
+
+
 def _salvar_notas_empresa(db: Session, empresa_id: int, xmls: list, force_update: bool = False, batch_status: dict = None, batch_id: str = None) -> int:
     """Salva XMLs de uma empresa no banco com UPSERT + delta detection.
     
@@ -206,6 +361,32 @@ def _salvar_notas_empresa(db: Session, empresa_id: int, xmls: list, force_update
     from sqlalchemy import update
     import hashlib
 
+    # A ADN dá ao evento de cancelamento a MESMA chave da NFS-e (chNFSe == chave_acesso).
+    # Eventos NÃO são notas: devem sair do upsert e apenas marcar a nota original como cancelada.
+    # Enquanto os eventos compartilham a chave da nota, um upsert com ambos colidiria no mesmo
+    # (empresa_id, chave_acesso, tipo_documento) no mesmo comando (CardinalityViolation).
+    eventos_coletados: list[dict] = []
+    xmls_unicos: list[dict] = []
+    vistos: set[str] = set()
+    for x in xmls:
+        evento_tipo = x.get("evento_tipo")
+        if evento_tipo:
+            eventos_coletados.append({
+                "chave_ref": x.get("chave_referenciada"),
+                "tipo_evento": evento_tipo,
+                "descricao": x.get("evento_descricao"),
+                "data_evento": _parse_data_evento(x.get("data_evento")),
+            })
+            continue
+        chave = x.get("chave") or x.get("chave_acesso")
+        if chave and chave in vistos:
+            print(f"[ADN] XML duplicado da chave {chave} (NSU {x.get('nsu')}) — ignorado")
+            continue
+        if chave:
+            vistos.add(chave)
+        xmls_unicos.append(x)
+    xmls = xmls_unicos
+
     def _atualiza_msg(msg: str):
         if batch_status and batch_id and batch_id in batch_status:
             cid = str(empresa_id)
@@ -217,11 +398,17 @@ def _salvar_notas_empresa(db: Session, empresa_id: int, xmls: list, force_update
         normalized = ' '.join(xml_str.split())
         return hashlib.sha256(normalized.encode()).hexdigest()[:32]
 
-    # Buscar chaves existentes + hash atual no banco (uma query só)
+    # Buscar chaves existentes + hash atual no banco (uma query só), escopada à empresa.
+    # A mesma nota (mesma chave) pode ser distribuída a várias empresas tomadoras:
+    # cada empresa precisa do seu próprio registro nfse apontando para o seu documento.
     _atualiza_msg("Verificando notas existentes...")
+    chaves_xml = [x.get("chave") or x.get("chave_acesso") for x in xmls if x.get("chave") or x.get("chave_acesso")]
     existentes = db.execute(
-        select(Nfse.chave_acesso, Nfse.xml_hash).where(
-            Nfse.chave_acesso.in_([x.get("chave") or x.get("chave_acesso") for x in xmls if x.get("chave") or x.get("chave_acesso")]),
+        select(Nfse.chave_acesso, Nfse.xml_hash)
+        .join(DocumentoFiscal, Nfse.documento_fiscal_id == DocumentoFiscal.id)
+        .where(
+            DocumentoFiscal.empresa_id == empresa_id,
+            Nfse.chave_acesso.in_(chaves_xml),
         )
     ).all()
     
@@ -247,26 +434,37 @@ def _salvar_notas_empresa(db: Session, empresa_id: int, xmls: list, force_update
         for xml_data in lote:
             campos = extrair_campos_nfse(xml_data["xml"])
             chave = campos.get("chave_acesso") or xml_data.get("chave")
-            
+
+            evento_tipo = xml_data.get("evento_tipo")
+            evento_descricao = xml_data.get("evento_descricao")
+
             if not chave:
+                print(f"[ADN] XML sem chave de acesso (NSU {xml_data.get('nsu')}, tipo {xml_data.get('tipo')}) — ignorado")
                 continue
-            
+
             # Calcular hash do XML novo
             xml_str = xml_data["xml"]
             xml_hash = _xml_hash(xml_str)
-            
+
             # Verificar se precisa atualizar
             hash_antigo = hash_no_banco.get(chave)
-            
+
             if hash_antigo == xml_hash and not force_update:
                 # XML idêntico ao salvo - pular
                 ignorados += 1
                 continue
-            
+
             # Precisa inserir ou atualizar
             periodo = campos.get("competencia") or xml_data.get("competencia") or "0000-00"
             valor_servico = campos.get("valor_servico")
-            
+
+            if evento_tipo:
+                situacao = situacao_para_evento(evento_tipo)
+                observacao = evento_descricao
+            else:
+                situacao = campos.get("tipo_evento") or "normal"
+                observacao = campos.get("descricao_evento")
+
             lote_doc_dicts.append({
                 "empresa_id": empresa_id,
                 "tipo_documento": TipoDocumento.NFSE,
@@ -274,13 +472,15 @@ def _salvar_notas_empresa(db: Session, empresa_id: int, xmls: list, force_update
                 "chave_acesso": chave,
                 "numero_documento": campos.get("numero_nfse"),
                 "valor_total": valor_servico,
-                "situacao": campos.get("tipo_evento") or "normal",
-                "observacao": campos.get("descricao_evento"),
+                "situacao": situacao,
+                "observacao": observacao,
                 "arquivo_fonte": campos.get("arquivo_fonte"),
                 "data_emissao": campos.get("data_emissao"),
                 "ativo": True,
             })
-            
+
+            data_evento = _parse_data_evento(xml_data.get("data_evento"))
+
             nfse_data = {
                 "chave_acesso": chave,
                 "nsu": xml_data.get("nsu"),
@@ -289,6 +489,10 @@ def _salvar_notas_empresa(db: Session, empresa_id: int, xmls: list, force_update
                 "competencia": periodo,
                 "xml_original": xml_str,
                 "xml_hash": xml_hash,  # NOVO: armazenar hash para delta detection
+                "tipo_evento": evento_tipo or campos.get("tipo_evento"),
+                "descricao_evento": evento_descricao or campos.get("descricao_evento"),
+                "data_evento": data_evento or campos.get("data_evento"),
+                "chave_nfe_referenciada": xml_data.get("chave_referenciada") or campos.get("chave_nfe_referenciada"),
             }
             for campo in [
                 "identificador_nfse", "numero_nfse", "codigo_verificacao", "versao_leiaute",
@@ -308,9 +512,9 @@ def _salvar_notas_empresa(db: Session, empresa_id: int, xmls: list, force_update
             ]:
                 if campo in campos:
                     nfse_data[campo] = campos[campo]
-            
+
             lote_nfse_dicts.append(nfse_data)
-            
+
             if hash_antigo is None:
                 salvos += 1
             else:
@@ -365,8 +569,449 @@ def _salvar_notas_empresa(db: Session, empresa_id: int, xmls: list, force_update
             
             db.commit()
     
+    # Marcar as notas originais cujos eventos de cancelamento chegaram neste lote
+    try:
+        marcados = _marcar_notas_canceladas(db, empresa_id, eventos_coletados)
+        if marcados:
+            print(f"[ADN] {marcados} notas marcadas como canceladas (empresa {empresa_id})")
+    except Exception as e:
+        print(f"[ADN] Erro ao marcar notas canceladas (empresa {empresa_id}): {e}")
+
+    # Reconciliar eventos de cancelamento com as notas originais desta empresa
+    try:
+        reconciliados = _reconciliar_eventos_cancelamento(db, empresa_id)
+        if reconciliados:
+            _atualiza_msg(f"{reconciliados} notas marcadas como canceladas")
+    except Exception as e:
+        print(f"[ADN] Erro ao reconciliar eventos de cancelamento (empresa {empresa_id}): {e}")
+
     _atualiza_msg(f"Concluído: {salvos} novas, {atualizados} atualizadas, {ignorados} inalteradas")
     return salvos + atualizados
+
+
+def _notas_base_query():
+    return (
+        select(Nfse, DocumentoFiscal, Company)
+        .join(DocumentoFiscal, Nfse.documento_fiscal_id == DocumentoFiscal.id)
+        .join(Company, DocumentoFiscal.empresa_id == Company.id)
+        .where(
+            DocumentoFiscal.tipo_documento == TipoDocumento.NFSE,
+            DocumentoFiscal.ativo == True,
+        )
+    )
+
+
+def _notas_join_query():
+    return (
+        select(Nfse)
+        .join(DocumentoFiscal, Nfse.documento_fiscal_id == DocumentoFiscal.id)
+        .join(Company, DocumentoFiscal.empresa_id == Company.id)
+        .where(
+            DocumentoFiscal.tipo_documento == TipoDocumento.NFSE,
+            DocumentoFiscal.ativo == True,
+        )
+    )
+
+
+def _apply_nota_filters(
+    query,
+    empresa_id: Optional[int] = None,
+    competencia_inicio: Optional[str] = None,
+    competencia_fim: Optional[str] = None,
+    role: Optional[str] = None,
+    tipo_evento: Optional[str] = None,
+    situacao: Optional[str] = None,
+    iss_retido: Optional[str] = None,
+    search: Optional[str] = None,
+    valor_min: Optional[float] = None,
+    valor_max: Optional[float] = None,
+):
+    if empresa_id is not None:
+        query = query.where(DocumentoFiscal.empresa_id == empresa_id)
+    if competencia_inicio:
+        query = query.where(Nfse.competencia >= competencia_inicio)
+    if competencia_fim:
+        query = query.where(Nfse.competencia <= competencia_fim)
+    if role:
+        query = query.where(func.lower(Nfse.role) == role.lower())
+    if tipo_evento:
+        query = query.where(Nfse.tipo_evento == tipo_evento)
+    if situacao:
+        query = query.where(DocumentoFiscal.situacao == situacao)
+    if iss_retido is not None:
+        query = query.where(Nfse.iss_retido == iss_retido)
+    if valor_min is not None:
+        query = query.where(Nfse.valor_servico >= valor_min)
+    if valor_max is not None:
+        query = query.where(Nfse.valor_servico <= valor_max)
+    if search:
+        s = search.strip()
+        digits = "".join(ch for ch in s if ch.isdigit())
+        conds = [
+            Nfse.chave_acesso.ilike(f"%{s}%"),
+            Nfse.numero_nfse.ilike(f"%{s}%"),
+            Nfse.razao_social_prestador.ilike(f"%{s}%"),
+            Nfse.razao_social_tomador.ilike(f"%{s}%"),
+        ]
+        if digits:
+            conds += [
+                Nfse.cnpj_prestador.ilike(f"%{digits}%"),
+                Nfse.cnpj_tomador.ilike(f"%{digits}%"),
+                Nfse.cpf_prestador.ilike(f"%{digits}%"),
+                Nfse.cpf_tomador.ilike(f"%{digits}%"),
+            ]
+        query = query.where(or_(*conds))
+    return query
+
+
+def _nota_resumo_dict(n: Nfse, doc: DocumentoFiscal, emp: Company) -> dict:
+    return {
+        "id": n.id,
+        "documento_fiscal_id": n.documento_fiscal_id,
+        "empresa_id": doc.empresa_id,
+        "empresa_nome": emp.nome if emp else None,
+        "empresa_cnpj": emp.cnpj if emp else None,
+        "competencia": n.competencia or doc.periodo,
+        "data_emissao": n.data_emissao or doc.data_emissao,
+        "numero_nfse": n.numero_nfse or doc.numero_documento,
+        "chave_acesso": n.chave_acesso or doc.chave_acesso,
+        "role": n.role,
+        "tipo_documento_api": n.tipo_documento_api,
+        "tipo_evento": n.tipo_evento,
+        "situacao": doc.situacao,
+        "cnpj_prestador": n.cnpj_prestador,
+        "razao_social_prestador": n.razao_social_prestador,
+        "cnpj_tomador": n.cnpj_tomador,
+        "razao_social_tomador": n.razao_social_tomador,
+        "codigo_servico": n.codigo_servico,
+        "descricao_servico": n.descricao_servico,
+        "valor_servico": n.valor_servico,
+        "valor_liquido": n.valor_liquido,
+        "base_calculo_iss": n.base_calculo_iss,
+        "aliquota_iss": n.aliquota_iss,
+        "valor_iss": n.valor_iss,
+        "iss_retido": n.iss_retido,
+        "valor_iss_retido": n.valor_iss_retido,
+        "valor_total": doc.valor_total,
+        "ativo": doc.ativo,
+        "atualizado_em": n.atualizado_em,
+    }
+
+
+@router.get("/notas/dashboard/resumo", response_model=DashboardResumoOut)
+async def notas_dashboard_resumo(
+    empresa_id: Optional[int] = Query(None),
+    competencia_inicio: Optional[str] = Query(None, description="Competência inicial YYYY-MM"),
+    competencia_fim: Optional[str] = Query(None, description="Competência final YYYY-MM"),
+    role: Optional[str] = Query(None),
+    db: Session = Depends(get_db),
+    api_key: str = Depends(api_key_dep),
+):
+    agg = _apply_nota_filters(
+        select(
+            func.count(Nfse.id).label("total_notas"),
+            func.coalesce(func.sum(Nfse.valor_servico), 0).label("total_valor_servico"),
+            func.coalesce(func.sum(Nfse.valor_iss), 0).label("total_iss"),
+            func.coalesce(func.sum(Nfse.valor_iss_retido), 0).label("total_iss_retido"),
+        )
+        .join(DocumentoFiscal, Nfse.documento_fiscal_id == DocumentoFiscal.id)
+        .join(Company, DocumentoFiscal.empresa_id == Company.id)
+        .where(
+            DocumentoFiscal.tipo_documento == TipoDocumento.NFSE,
+            DocumentoFiscal.ativo == True,
+        ),
+        empresa_id=empresa_id,
+        competencia_inicio=competencia_inicio,
+        competencia_fim=competencia_fim,
+        role=role,
+    )
+    row = db.execute(agg).first()
+
+    def _count(extra=None, role_value: Optional[str] = None):
+        q = _apply_nota_filters(
+            select(func.count(Nfse.id))
+            .join(DocumentoFiscal, Nfse.documento_fiscal_id == DocumentoFiscal.id)
+            .join(Company, DocumentoFiscal.empresa_id == Company.id)
+            .where(
+                DocumentoFiscal.tipo_documento == TipoDocumento.NFSE,
+                DocumentoFiscal.ativo == True,
+            ),
+            empresa_id=empresa_id,
+            competencia_inicio=competencia_inicio,
+            competencia_fim=competencia_fim,
+            role=role,
+        )
+        if role_value is not None:
+            q = q.where(func.lower(Nfse.role) == role_value)
+        if extra is not None:
+            q = q.where(extra)
+        return db.execute(q).scalar() or 0
+
+    # Camada de verificação (cálculo automático, sem marcação manual)
+    from datetime import datetime, timedelta, timezone
+
+    ultima_sync = db.execute(
+        select(func.max(DocumentoFiscal.data_extracao))
+        .where(
+            DocumentoFiscal.tipo_documento == TipoDocumento.NFSE,
+            DocumentoFiscal.ativo == True,
+        )
+    ).scalar()
+    novas_desde_ontem = db.execute(
+        select(func.count(DocumentoFiscal.id))
+        .where(
+            DocumentoFiscal.tipo_documento == TipoDocumento.NFSE,
+            DocumentoFiscal.ativo == True,
+            DocumentoFiscal.data_extracao >= datetime.now(timezone.utc) - timedelta(days=1),
+        )
+    ).scalar() or 0
+    saude = "ok" if (
+        (_count(extra=or_(Nfse.xml_original.is_(None), Nfse.xml_original == "")) == 0)
+        and (_count(extra=or_(Nfse.competencia.is_(None), Nfse.competencia == "")) == 0)
+    ) else "atencao"
+
+    return DashboardResumoOut(
+        total_notas=row.total_notas or 0,
+        total_valor_servico=float(row.total_valor_servico or 0),
+        total_iss=float(row.total_iss or 0),
+        total_iss_retido=float(row.total_iss_retido or 0),
+        notas_prestadas=_count(role_value="prestado"),
+        notas_tomadas=_count(role_value="tomado"),
+        notas_outras=_count(extra=or_(Nfse.role.is_(None), func.lower(Nfse.role).notin_(["prestado", "tomado"]))),
+        notas_canceladas=_count(extra=Nfse.tipo_evento.is_not(None)),
+        empresas_com_notas=db.execute(
+            _apply_nota_filters(
+                select(func.count(func.distinct(DocumentoFiscal.empresa_id)))
+                .select_from(Nfse)
+                .join(DocumentoFiscal, Nfse.documento_fiscal_id == DocumentoFiscal.id)
+                .join(Company, DocumentoFiscal.empresa_id == Company.id)
+                .where(
+                    DocumentoFiscal.tipo_documento == TipoDocumento.NFSE,
+                    DocumentoFiscal.ativo == True,
+                ),
+                empresa_id=empresa_id,
+                competencia_inicio=competencia_inicio,
+                competencia_fim=competencia_fim,
+                role=role,
+            )
+        ).scalar() or 0,
+        notas_sem_competencia=_count(extra=or_(Nfse.competencia.is_(None), Nfse.competencia == "")),
+        notas_sem_xml=_count(extra=or_(Nfse.xml_original.is_(None), Nfse.xml_original == "")),
+        ultima_sincronizacao=ultima_sync,
+        notas_novas_desde_ontem=novas_desde_ontem,
+        saude_conferencia=saude,
+    )
+
+
+@router.get("/notas/dashboard/series", response_model=List[DashboardSerieItem])
+async def notas_dashboard_series(
+    empresa_id: Optional[int] = Query(None),
+    competencia_inicio: Optional[str] = Query(None),
+    competencia_fim: Optional[str] = Query(None),
+    role: Optional[str] = Query(None),
+    db: Session = Depends(get_db),
+    api_key: str = Depends(api_key_dep),
+):
+    totals = db.execute(
+        _apply_nota_filters(
+            select(
+                Nfse.competencia.label("competencia"),
+                func.count(Nfse.id).label("total_notas"),
+                func.coalesce(func.sum(Nfse.valor_servico), 0).label("valor_servico"),
+                func.coalesce(func.sum(Nfse.valor_iss), 0).label("valor_iss"),
+            )
+            .select_from(Nfse)
+            .join(DocumentoFiscal, Nfse.documento_fiscal_id == DocumentoFiscal.id)
+            .join(Company, DocumentoFiscal.empresa_id == Company.id)
+            .where(
+                DocumentoFiscal.tipo_documento == TipoDocumento.NFSE,
+                DocumentoFiscal.ativo == True,
+            )
+            .group_by(Nfse.competencia)
+            .order_by(Nfse.competencia),
+            empresa_id=empresa_id,
+            competencia_inicio=competencia_inicio,
+            competencia_fim=competencia_fim,
+            role=role,
+        )
+    ).all()
+
+    roles = db.execute(
+        _apply_nota_filters(
+            select(
+                Nfse.competencia.label("competencia"),
+                func.lower(Nfse.role).label("role"),
+                func.count(Nfse.id).label("total"),
+            )
+            .select_from(Nfse)
+            .join(DocumentoFiscal, Nfse.documento_fiscal_id == DocumentoFiscal.id)
+            .join(Company, DocumentoFiscal.empresa_id == Company.id)
+            .where(
+                DocumentoFiscal.tipo_documento == TipoDocumento.NFSE,
+                DocumentoFiscal.ativo == True,
+            )
+            .group_by(Nfse.competencia, func.lower(Nfse.role)),
+            empresa_id=empresa_id,
+            competencia_inicio=competencia_inicio,
+            competencia_fim=competencia_fim,
+            role=role,
+        )
+    ).all()
+
+    role_by_comp = {}
+    for r in roles:
+        role_by_comp.setdefault(r.competencia, {})[r.role] = r.total
+
+    return [
+        DashboardSerieItem(
+            competencia=r.competencia,
+            total_notas=r.total_notas or 0,
+            notas_prestadas=role_by_comp.get(r.competencia, {}).get("prestado", 0),
+            notas_tomadas=role_by_comp.get(r.competencia, {}).get("tomado", 0),
+            valor_servico=float(r.valor_servico or 0),
+            valor_iss=float(r.valor_iss or 0),
+        )
+        for r in totals
+    ]
+
+
+@router.get("/notas/dashboard/empresas", response_model=List[DashboardEmpresaItem])
+async def notas_dashboard_empresas(
+    empresa_id: Optional[int] = Query(None),
+    competencia_inicio: Optional[str] = Query(None),
+    competencia_fim: Optional[str] = Query(None),
+    role: Optional[str] = Query(None),
+    limit: int = Query(10, ge=1, le=50),
+    db: Session = Depends(get_db),
+    api_key: str = Depends(api_key_dep),
+):
+    rows = db.execute(
+        _apply_nota_filters(
+            select(
+                Company.id.label("empresa_id"),
+                Company.nome.label("nome"),
+                Company.cnpj.label("cnpj"),
+                func.count(Nfse.id).label("total_notas"),
+                func.coalesce(func.sum(Nfse.valor_servico), 0).label("valor_servico"),
+                func.coalesce(func.sum(Nfse.valor_iss), 0).label("valor_iss"),
+            )
+            .select_from(Nfse)
+            .join(DocumentoFiscal, Nfse.documento_fiscal_id == DocumentoFiscal.id)
+            .join(Company, DocumentoFiscal.empresa_id == Company.id)
+            .where(
+                DocumentoFiscal.tipo_documento == TipoDocumento.NFSE,
+                DocumentoFiscal.ativo == True,
+            )
+            .group_by(Company.id, Company.nome, Company.cnpj)
+            .order_by(func.count(Nfse.id).desc())
+            .limit(limit),
+            empresa_id=empresa_id,
+            competencia_inicio=competencia_inicio,
+            competencia_fim=competencia_fim,
+            role=role,
+        )
+    ).all()
+
+    return [
+        DashboardEmpresaItem(
+            empresa_id=r.empresa_id,
+            nome=r.nome,
+            cnpj=r.cnpj,
+            total_notas=r.total_notas or 0,
+            valor_servico=float(r.valor_servico or 0),
+            valor_iss=float(r.valor_iss or 0),
+        )
+        for r in rows
+    ]
+
+
+@router.get("/notas", response_model=PaginatedResponse[NotaResumoOut])
+async def list_notas(
+    empresa_id: Optional[int] = Query(None),
+    competencia_inicio: Optional[str] = Query(None),
+    competencia_fim: Optional[str] = Query(None),
+    role: Optional[str] = Query(None),
+    tipo_evento: Optional[str] = Query(None),
+    situacao: Optional[str] = Query(None),
+    iss_retido: Optional[str] = Query(None),
+    search: Optional[str] = Query(None),
+    valor_min: Optional[float] = Query(None),
+    valor_max: Optional[float] = Query(None),
+    sort: str = Query("competencia"),
+    order: str = Query("desc"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    db: Session = Depends(get_db),
+    api_key: str = Depends(api_key_dep),
+):
+    base = _apply_nota_filters(
+        _notas_base_query(),
+        empresa_id=empresa_id,
+        competencia_inicio=competencia_inicio,
+        competencia_fim=competencia_fim,
+        role=role,
+        tipo_evento=tipo_evento,
+        situacao=situacao,
+        iss_retido=iss_retido,
+        search=search,
+        valor_min=valor_min,
+        valor_max=valor_max,
+    )
+    total = db.execute(select(func.count()).select_from(base.subquery())).scalar() or 0
+
+    sort_map = {
+        "competencia": Nfse.competencia,
+        "data_emissao": Nfse.data_emissao,
+        "valor_servico": Nfse.valor_servico,
+        "valor_iss": Nfse.valor_iss,
+        "atualizado_em": Nfse.atualizado_em,
+        "numero_nfse": Nfse.numero_nfse,
+        "empresa": Company.nome,
+        "role": Nfse.role,
+    }
+    sort_col = sort_map.get(sort, Nfse.competencia)
+    order_col = sort_col.asc().nullslast() if order.lower() == "asc" else sort_col.desc().nullslast()
+    offset = (page - 1) * page_size
+    rows = db.execute(base.order_by(order_col, Nfse.id.desc()).offset(offset).limit(page_size)).all()
+    items = [_nota_resumo_dict(n, doc, emp) for n, doc, emp in rows]
+    total_pages = (total + page_size - 1) // page_size if total > 0 else 0
+    return PaginatedResponse[NotaResumoOut](items=items, total=total, page=page, page_size=page_size, total_pages=total_pages)
+
+
+@router.get("/notas/{nota_id}", response_model=NotaDetalheOut)
+async def get_nota(nota_id: int, db: Session = Depends(get_db), api_key: str = Depends(api_key_dep)):
+    row = db.execute(
+        _notas_base_query().where(Nfse.id == nota_id)
+    ).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Nota não encontrada")
+    n, doc, emp = row
+    data = NfseOut.model_validate(n).model_dump()
+    data.update(
+        {
+            "empresa_id": doc.empresa_id,
+            "empresa_nome": emp.nome if emp else None,
+            "empresa_cnpj": emp.cnpj if emp else None,
+            "situacao": doc.situacao,
+            "valor_total": doc.valor_total,
+            "tem_xml": bool(n.xml_original),
+            "xml_original": None,
+        }
+    )
+    return NotaDetalheOut(**data)
+
+
+@router.get("/notas/{nota_id}/xml")
+async def get_nota_xml(nota_id: int, db: Session = Depends(get_db), api_key: str = Depends(api_key_dep)):
+    n = db.execute(select(Nfse).where(Nfse.id == nota_id)).scalar_one_or_none()
+    if not n or not n.xml_original:
+        raise HTTPException(status_code=404, detail="XML não encontrado")
+    filename = f"NFSe_{n.chave_acesso or n.numero_nfse or nota_id}.xml"
+    return Response(
+        content=n.xml_original,
+        media_type="application/xml",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @router.get("/relatorio/xlsx")
@@ -435,7 +1080,7 @@ async def download_relatorio_nfse_xlsx(
             notas_query = notas_query.where(Nfse.competencia <= periodo_fim)
         notas_db = db.execute(notas_query).scalars().all()
 
-        # Calcular totais por role
+        # Calcular totais por role (eventos de cancelamento não são notas — apenas marcam a nota original)
         notas_prestado = 0
         notas_tomado = 0
         notas_cancelado = 0
@@ -444,13 +1089,18 @@ async def download_relatorio_nfse_xlsx(
 
         notas_list = []
         for n in notas_db:
+            if (n.tipo_documento_api or "").upper() == "EVENTO":
+                # Evento de cancelamento não entra nos totais nem no DETALHAMENTO
+                continue
             role = (n.role or "").lower()
-            if role == "prestado":
-                notas_prestado += 1
+            evento_cancelamento = bool(n.tipo_evento) and n.tipo_evento in EVENTO_CANCELAMENTO
+            evento_cancelamento = evento_cancelamento or (bool(n.tipo_evento) and situacao_para_evento(n.tipo_evento) == "cancelada")
+            if evento_cancelamento:
+                notas_cancelado += 1
             elif role == "tomado":
                 notas_tomado += 1
-            elif n.tipo_evento:
-                notas_cancelado += 1
+            elif role == "prestado":
+                notas_prestado += 1
             else:
                 # Se não tem role nem tipo_evento, assume prestado
                 notas_prestado += 1
@@ -478,13 +1128,18 @@ async def download_relatorio_nfse_xlsx(
                 "aliquota_iss": float(n.aliquota_iss or 0),
                 "valor_iss": float(n.valor_iss or 0),
                 "iss_retido": n.iss_retido,
+                "tipo_evento": n.tipo_evento,
+                "descricao_evento": n.descricao_evento,
+                "situacao": "Cancelada" if evento_cancelamento else ("Evento" if n.tipo_evento else "Normal"),
             })
+
+        total_notas = notas_prestado + notas_tomado + notas_cancelado
 
         empresas_data.append({
             "id": emp.id,
             "razao_social": emp.nome,
             "cnpj": emp.cnpj,
-            "total_notas": len(notas_db),
+            "total_notas": total_notas,
             "notas_prestado": notas_prestado,
             "notas_tomado": notas_tomado,
             "notas_cancelado": notas_cancelado,
@@ -638,6 +1293,15 @@ async def _process_batch_background(
                 valor_prestado_sem_retencao = 0.0
             
                 for xml_data in xmls:
+                    tipo_api = (xml_data.get("tipo") or "").upper()
+                    evento_tipo = xml_data.get("evento_tipo")
+
+                    if tipo_api == "EVENTO":
+                        # Evento de cancelamento não entra nos totais de notas
+                        if evento_tipo and evento_tipo in EVENTO_CANCELAMENTO:
+                            notas_canceladas += 1
+                        continue
+
                     campos = extrair_campos_nfse(xml_data["xml"])
                     vs = float(campos.get("valor_servico") or 0)
                     if vs == 0:
@@ -646,7 +1310,8 @@ async def _process_batch_background(
                     valor_iss += float(campos.get("valor_iss") or 0)
                 
                     role = (xml_data.get("role") or "").lower()
-                    if campos.get("tipo_evento"):
+                    evento_tipo = evento_tipo or campos.get("tipo_evento")
+                    if evento_tipo in EVENTO_CANCELAMENTO:
                         notas_canceladas += 1
                         valor_cancelado += vs
                     elif role == "prestado":
@@ -786,9 +1451,18 @@ def _gerar_zip_batch(batch_id: str, datainicio: str | None, datafim: str | None)
                     from app.models.documento_fiscal import DocumentoFiscal, TipoDocumento
                     from app.models.nfse import Nfse
                 
+                    notas_query = (
+                        select(Nfse)
+                        .join(DocumentoFiscal, Nfse.documento_fiscal_id == DocumentoFiscal.id)
+                        .where(
+                            DocumentoFiscal.empresa_id == company_id,
+                            DocumentoFiscal.tipo_documento == TipoDocumento.NFSE,
+                            DocumentoFiscal.ativo == True,
+                        )
+                    )
                     periodo_inicio = _para_ym(datainicio) if datainicio else None
                     periodo_fim = _para_ym(datafim) if datafim else None
-                
+                    
                     # CORRECAO: usar range periodo inicio a fim (nao so primeiro mes)
                     if periodo_inicio:
                         notas_query = notas_query.where(Nfse.competencia >= periodo_inicio)
@@ -798,7 +1472,8 @@ def _gerar_zip_batch(batch_id: str, datainicio: str | None, datafim: str | None)
                     notas_db = db.execute(notas_query).scalars().all()
                 
                 
-                    # Mesmo processamento do relatório
+                    # Mesmo processamento do relatório:
+                    # eventos de cancelamento não são notas — marcam a nota original
                     notas_prestado = 0
                     notas_tomado = 0
                     notas_cancelado = 0
@@ -807,13 +1482,16 @@ def _gerar_zip_batch(batch_id: str, datainicio: str | None, datafim: str | None)
                     notas_list = []
                 
                     for n in notas_db:
+                        if (n.tipo_documento_api or "").upper() == "EVENTO":
+                            continue
                         role = (n.role or "").lower()
-                        if role == "prestado":
-                            notas_prestado += 1
+                        evento_cancelamento = bool(n.tipo_evento) and situacao_para_evento(n.tipo_evento) == "cancelada"
+                        if evento_cancelamento:
+                            notas_cancelado += 1
                         elif role == "tomado":
                             notas_tomado += 1
-                        elif n.tipo_evento:
-                            notas_cancelado += 1
+                        elif role == "prestado":
+                            notas_prestado += 1
                         else:
                             notas_prestado += 1
                     
@@ -840,13 +1518,18 @@ def _gerar_zip_batch(batch_id: str, datainicio: str | None, datafim: str | None)
                             "aliquota_iss": float(n.aliquota_iss or 0),
                             "valor_iss": float(n.valor_iss or 0),
                             "iss_retido": n.iss_retido,
+                            "tipo_evento": n.tipo_evento,
+                            "descricao_evento": n.descricao_evento,
+                            "situacao": "Cancelada" if evento_cancelamento else ("Evento" if n.tipo_evento else "Normal"),
                         })
+
+                    total_notas = notas_prestado + notas_tomado + notas_cancelado
                 
                     empresas_xlsx.append({
                         "id": company_id,
                         "razao_social": company_info.get("nome", ""),
                         "cnpj": company_info.get("cnpj", ""),
-                        "total_notas": len(notas_db),
+                        "total_notas": total_notas,
                         "notas_prestado": notas_prestado,
                         "notas_tomado": notas_tomado,
                         "notas_cancelado": notas_cancelado,

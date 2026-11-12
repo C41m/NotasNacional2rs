@@ -233,19 +233,19 @@ def gerar_xlsx_nfse_download(
     ws2 = wb.create_sheet("DETALHAMENTO")
 
     row = 1
-    ws2.merge_cells('A1:R1')
+    ws2.merge_cells('A1:S1')
     cell = ws2.cell(row=1, column=1, value="2RS Notas - Detalhamento de Notas Fiscais NFSe")
     cell.font = TITLE_FONT
     cell.alignment = Alignment(horizontal='center', vertical='center')
     row += 1
 
-    ws2.merge_cells(f'A{row}:R{row}')
+    ws2.merge_cells(f'A{row}:S{row}')
     cell = ws2.cell(row=row, column=1, value=f"Competência: {periodo}")
     cell.font = SUBTITLE_FONT
     cell.alignment = Alignment(horizontal='center', vertical='center')
     row += 1
 
-    ws2.merge_cells(f'A{row}:R{row}')
+    ws2.merge_cells(f'A{row}:S{row}')
     cell = ws2.cell(row=row, column=1, value=f"Gerado em: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}")
     cell.font = NORMAL_FONT
     cell.alignment = Alignment(horizontal='center', vertical='center')
@@ -256,7 +256,7 @@ def gerar_xlsx_nfse_download(
         "Data Emissão", "Tipo", "Prestador (CNPJ)", "Prestador (Nome)",
         "Tomador (CNPJ)", "Tomador (Nome)", "Código Serviço",
         "Descrição Serviço", "Valor Serviço (R$)", "Base Cálculo ISS (R$)",
-        "Alíquota ISS (%)", "Valor ISS (R$)", "ISS Retido"
+        "Alíquota ISS (%)", "Valor ISS (R$)", "ISS Retido", "Situação"
     ]
     for col, header in enumerate(detalhe_headers, 1):
         ws2.cell(row=row, column=col, value=header)
@@ -300,13 +300,14 @@ def gerar_xlsx_nfse_download(
             ws2.cell(row=row, column=17, value=n.get("valor_iss", 0.0) or 0.0)
             ws2.cell(row=row, column=17).number_format = '#,##0.00'
             ws2.cell(row=row, column=18, value="Sim" if n.get("iss_retido") == "1" else "Não")
+            ws2.cell(row=row, column=19, value=n.get("situacao") or ("Cancelada" if n.get("tipo_evento") else "Normal"))
 
             for col in range(1, len(detalhe_headers) + 1):
                 _apply_cell_style(ws2, row, col)
             row += 1
 
     # Ajustar larguras da aba DETALHAMENTO
-    widths_detalhe = [35, 18, 30, 14, 12, 18, 14, 18, 30, 18, 30, 14, 35, 16, 16, 12, 16, 10]
+    widths_detalhe = [35, 18, 30, 14, 12, 18, 14, 18, 30, 18, 30, 14, 35, 16, 16, 12, 16, 10, 12]
     for i, w in enumerate(widths_detalhe, 1):
         ws2.column_dimensions[get_column_letter(i)].width = w
 

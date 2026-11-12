@@ -39,6 +39,24 @@ MAPEVENTOS = {
     "101104": "MANIFESTACAO_NAO_REALIZADA",  # Manifestação Não Realizada
 }
 
+# Códigos de evento que representam cancelamento efetivo da NFS-e
+EVENTO_CANCELAMENTO = {"101101", "105102", "105104", "305101"}
+
+
+def situacao_para_evento(evento_tipo: Optional[str]) -> str:
+    """Mapeia o código do evento para a situação do documento fiscal.
+
+    - Cancelamento de NFS-e -> 'cancelada'
+    - Outros eventos -> descrição do evento em minúsculo (ex.: 'manifestacao_rejeicao')
+    - Sem evento -> 'normal'
+    """
+    if not evento_tipo:
+        return "normal"
+    if evento_tipo in EVENTO_CANCELAMENTO:
+        return "cancelada"
+    descricao = MAPEVENTOS.get(evento_tipo) or f"evento_{evento_tipo}"
+    return descricao.lower()
+
 
 class ADNError(Exception):
     """Erro na comunicação com a API ADN."""
@@ -69,6 +87,8 @@ def parse_xml_role_and_competence(xml_str: str, cnpj_interessado: str) -> dict:
                 'competencia': competencia,
                 'evento_tipo': None,
                 'evento_descricao': None,
+                'chave_referenciada': None,
+                'data_evento': None,
             }
         
         # Verificar se é Evento (pedRegEvento)
@@ -76,22 +96,51 @@ def parse_xml_role_and_competence(xml_str: str, cnpj_interessado: str) -> dict:
         if inf_ped_reg is not None:
             evento_tipo = None
             evento_desc = None
-            
-            # Extrair código do evento
-            tp_evento_elem = inf_ped_reg.find('.//nfse:tpEvento', ns)
-            if tp_evento_elem is not None and tp_evento_elem.text:
-                evento_tipo = tp_evento_elem.text.strip()
-                evento_desc = MAPEVENTOS.get(evento_tipo, f"EVENTO_{evento_tipo}")
-            
+
+            # O tipo do evento vem como elemento <eNNNNNN> dentro de infPedReg
+            # (ex.: <e101101> para Cancelamento de NFS-e). Não existe <tpEvento>.
+            for child in inf_ped_reg:
+                tag = child.tag.split('}')[-1]
+                if len(tag) == 7 and tag.startswith('e') and tag[1:].isdigit():
+                    evento_tipo = tag[1:]
+                    xdesc_elem = child.find('.//nfse:xDesc', ns)
+                    xdesc = xdesc_elem.text.strip() if xdesc_elem is not None and xdesc_elem.text else None
+                    evento_desc = MAPEVENTOS.get(evento_tipo) or xdesc or f"EVENTO_{evento_tipo}"
+                    break
+
+            # Fallback: elemento tpEvento (layout alternativo)
+            if not evento_tipo:
+                tp_evento_elem = inf_ped_reg.find('.//nfse:tpEvento', ns)
+                if tp_evento_elem is not None and tp_evento_elem.text:
+                    evento_tipo = tp_evento_elem.text.strip()
+                    evento_desc = MAPEVENTOS.get(evento_tipo, f"EVENTO_{evento_tipo}")
+
+            # Motivo do evento (xMotivo), se houver, entra na descrição
+            motivo_elem = inf_ped_reg.find('.//nfse:xMotivo', ns)
+            if motivo_elem is not None and motivo_elem.text:
+                motivo = motivo_elem.text.strip()
+                evento_desc = f"{evento_desc or 'EVENTO'} - {motivo}"
+
+            # Chave da NFS-e referenciada pelo evento (ex.: em um cancelamento)
+            chave_ref_elem = inf_ped_reg.find('.//nfse:chNFSe', ns)
+            chave_referenciada = chave_ref_elem.text.strip() if chave_ref_elem is not None and chave_ref_elem.text else None
+
+            data_evento_elem = inf_ped_reg.find('.//nfse:dhEvento', ns)
+            if data_evento_elem is None:
+                data_evento_elem = inf_ped_reg.find('.//nfse:dhRegEvento', ns)
+            data_evento = data_evento_elem.text.strip() if data_evento_elem is not None and data_evento_elem.text else None
+
             competencia = _extrair_competacao_evento(root, ns)
             role = _detectar_role_evento(inf_ped_reg, cnpj_interessado, ns)
-            
+
             return {
                 'tipo_documento': 'EVENTO',
                 'role': role,
                 'competencia': competencia,
                 'evento_tipo': evento_tipo,
                 'evento_descricao': evento_desc,
+                'chave_referenciada': chave_referenciada,
+                'data_evento': data_evento,
             }
         
         # Verificar se é NFS-e
@@ -105,8 +154,10 @@ def parse_xml_role_and_competence(xml_str: str, cnpj_interessado: str) -> dict:
                 'competencia': competencia,
                 'evento_tipo': None,
                 'evento_descricao': None,
+                'chave_referenciada': None,
+                'data_evento': None,
             }
-        
+
         # Estrutura não reconhecida
         return {
             'tipo_documento': None,
@@ -114,6 +165,8 @@ def parse_xml_role_and_competence(xml_str: str, cnpj_interessado: str) -> dict:
             'competencia': None,
             'evento_tipo': None,
             'evento_descricao': None,
+            'chave_referenciada': None,
+            'data_evento': None,
         }
         
     except Exception:
@@ -123,6 +176,8 @@ def parse_xml_role_and_competence(xml_str: str, cnpj_interessado: str) -> dict:
             'competencia': None,
             'evento_tipo': None,
             'evento_descricao': None,
+            'chave_referenciada': None,
+            'data_evento': None,
         }
 
 
@@ -204,8 +259,8 @@ def _detectar_role_evento(inf_ped_reg, cnpj_interessado: str, ns) -> str:
     """Detecta o papel do CNPJ interessado em um evento."""
     cnpj_clean = cnpj_interessado.replace(".", "").replace("/", "").replace("-", "")
 
-    # Eventos podem ter CNPJ do autor (cnpjAutor ou CPFAutor)
-    for path in ['.//nfse:cnpjAutor', './/nfse:CPFAutor']:
+    # Eventos podem ter CNPJ do autor (CNPJAutor ou cnpjAutor)
+    for path in ['.//nfse:CNPJAutor', './/nfse:cnpjAutor', './/nfse:CPFAutor', './/nfse:cpfAutor']:
         el = inf_ped_reg.find(path, ns)
         if el is not None and el.text == cnpj_clean:
             return 'autor_evento'
@@ -549,6 +604,8 @@ async def fetch_distribuicao(
                             "competencia": info.get("competencia") or "0000-00",
                             "evento_tipo": info.get("evento_tipo"),
                             "evento_descricao": info.get("evento_descricao"),
+                            "chave_referenciada": info.get("chave_referenciada"),
+                            "data_evento": info.get("data_evento"),
                         })
                         notas_processadas += 1
 

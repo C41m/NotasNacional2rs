@@ -113,6 +113,87 @@ class NfseOut(NfseBase):
     model_config = ConfigDict(from_attributes=True)
 
 
+class NotaResumoOut(BaseModel):
+    id: int
+    documento_fiscal_id: int
+    empresa_id: int
+    empresa_nome: Optional[str] = None
+    empresa_cnpj: Optional[str] = None
+    competencia: Optional[str] = None
+    data_emissao: Optional[datetime] = None
+    numero_nfse: Optional[str] = None
+    chave_acesso: Optional[str] = None
+    role: Optional[str] = None
+    tipo_documento_api: Optional[str] = None
+    tipo_evento: Optional[str] = None
+    situacao: Optional[str] = None
+    cnpj_prestador: Optional[str] = None
+    razao_social_prestador: Optional[str] = None
+    cnpj_tomador: Optional[str] = None
+    razao_social_tomador: Optional[str] = None
+    codigo_servico: Optional[str] = None
+    descricao_servico: Optional[str] = None
+    valor_servico: Optional[float] = None
+    valor_liquido: Optional[float] = None
+    base_calculo_iss: Optional[float] = None
+    aliquota_iss: Optional[float] = None
+    valor_iss: Optional[float] = None
+    iss_retido: Optional[str] = None
+    valor_iss_retido: Optional[float] = None
+    valor_total: Optional[float] = None
+    ativo: bool = True
+    atualizado_em: Optional[datetime] = None
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class NotaDetalheOut(NfseOut):
+    empresa_id: Optional[int] = None
+    empresa_nome: Optional[str] = None
+    empresa_cnpj: Optional[str] = None
+    situacao: Optional[str] = None
+    valor_total: Optional[float] = None
+    tem_xml: bool = False
+
+
+class DashboardResumoOut(BaseModel):
+    total_notas: int = 0
+    total_valor_servico: float = 0
+    total_iss: float = 0
+    total_iss_retido: float = 0
+    notas_prestadas: int = 0
+    notas_tomadas: int = 0
+    notas_outras: int = 0
+    notas_canceladas: int = 0
+    empresas_com_notas: int = 0
+    notas_sem_competencia: int = 0
+    notas_sem_xml: int = 0
+    # Camada de verificação (cálculo automático, sem marcação manual)
+    ultima_sincronizacao: Optional[datetime] = None
+    notas_novas_desde_ontem: int = 0
+    saude_conferencia: str = "ok"  # "ok" | "atencao"
+
+
+class DashboardSerieItem(BaseModel):
+    competencia: Optional[str] = None
+    total_notas: int = 0
+    notas_prestadas: int = 0
+    notas_tomadas: int = 0
+    valor_servico: float = 0
+    valor_iss: float = 0
+
+
+class DashboardEmpresaItem(BaseModel):
+    empresa_id: int
+    nome: Optional[str] = None
+    cnpj: Optional[str] = None
+    total_notas: int = 0
+    notas_prestadas: int = 0
+    notas_tomadas: int = 0
+    valor_servico: float = 0
+    valor_iss: float = 0
+
+
 # ---------------------------------------------------------------------------
 # Schemas para persistência de NFSe baixada via ADN
 # ---------------------------------------------------------------------------
