@@ -25,7 +25,9 @@ class Nfse(Base):
     local_incidencia_descricao = Column(String(150), nullable=True)  # xLocIncida
     tributo_nacional = Column(Text, nullable=True)              # xTribNac
     tributo_municipal = Column(Text, nullable=True)             # xTribMun
-    codigo_nbs = Column(String(20), nullable=True)              # xNBS
+    codigo_nbs = Column(Text, nullable=True)                # xNBS
+    c_class_trib = Column(Text, nullable=True)            # cClassTrib (RTC, notas 2026+)
+    op_simp_nac = Column(String(1), nullable=True)        # opSimpNac (regime Simples: 1=Não, 2=MEI, 3=ME/EPP — a confirmar na spec)
     versao_aplicacao = Column(String(50), nullable=True)        # verAplic
     ambiente_gerador = Column(String(1), nullable=True)         # ambGer
     tipo_emissao = Column(String(1), nullable=True)             # tpEmis
@@ -76,7 +78,7 @@ class Nfse(Base):
     base_calculo_iss = Column(Float, nullable=True)
     aliquota_iss = Column(Float, nullable=True)
     valor_iss = Column(Float, nullable=True)                     # vISSQN
-    iss_retido = Column(String(1), nullable=True)                # tpRetISSQN (0-Não, 1-Sim)
+    iss_retido = Column(String(1), nullable=True)                # tpRetISSQN (1=sem retenção, 2=retido pelo tomador, 3=retido pelo intermediário)
     valor_iss_retido = Column(Float, nullable=True)              # vRetISSQN
     # Valores adicionais (valores/)
     base_calculo_valor = Column(Float, nullable=True)            # vBC

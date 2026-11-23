@@ -408,7 +408,10 @@ def extrair_campos_nfse(xml_str: str) -> dict:
         # Serviço
         serv = inf_nfse.find('.//nfse:serv', ns)
         if serv is not None:
-            campos['codigo_servico'] = _texto(serv, './/nfse:cServ', ns)
+            cserv = serv.find('.//nfse:cServ', ns)
+            if cserv is not None:
+                campos['codigo_servico'] = _texto(cserv, 'nfse:cTribNac', ns) or _texto(cserv, 'nfse:cTribMun', ns)
+                campos['descricao_servico'] = _texto(cserv, 'nfse:xDescServ', ns) or _texto(inf_nfse, 'nfse:xTribNac', ns)
             info_compl = serv.find('.//nfse:infoCompl', ns)
             if info_compl is not None:
                 campos['informacoes_complementares'] = _texto(info_compl, './/nfse:xInfComp', ns)

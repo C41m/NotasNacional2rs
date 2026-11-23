@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Query
 from fastapi.responses import FileResponse, StreamingResponse, Response
 from sqlalchemy.orm import Session
-from sqlalchemy import select, insert, func, update, text, or_
+from sqlalchemy import select, insert, func, update, text, or_, case, and_
 from typing import List, Optional
 from app.core.database import SessionLocal, get_db
 from app.schemas.nfse import NFSEDownloadRequest, NFSEDownloadResponse, NFSEDownloadStatus, BatchDownloadRequest
@@ -18,6 +18,10 @@ from app.schemas.nfse_detail import (
     DashboardResumoOut,
     DashboardSerieItem,
     DashboardEmpresaItem,
+    AnaliseAtividadeItem,
+    AnaliseClienteItem,
+    AnaliseEmpresaOut,
+    AnaliseMatrizItem,
 )
 from app.services.adn_api import (
     fetch_distribuicao,
@@ -27,6 +31,7 @@ from app.services.adn_api import (
     situacao_para_evento,
 )
 from app.services.nfse_xlsx import gerar_xlsx_nfse_download
+from app.services.danfse import gerar_danfse
 from app.core.api_key import verify_api_key, api_key_dep
 import uuid
 import os
@@ -625,6 +630,10 @@ def _apply_nota_filters(
     search: Optional[str] = None,
     valor_min: Optional[float] = None,
     valor_max: Optional[float] = None,
+    so_canceladas: Optional[bool] = None,
+    so_sem_xml: Optional[bool] = None,
+    so_sem_competencia: Optional[bool] = None,
+    iss_sem_aliquota: Optional[bool] = None,
 ):
     if empresa_id is not None:
         query = query.where(DocumentoFiscal.empresa_id == empresa_id)
@@ -640,6 +649,14 @@ def _apply_nota_filters(
         query = query.where(DocumentoFiscal.situacao == situacao)
     if iss_retido is not None:
         query = query.where(Nfse.iss_retido == iss_retido)
+    if so_canceladas:
+        query = query.where(Nfse.tipo_evento.is_not(None))
+    if so_sem_xml:
+        query = query.where(or_(Nfse.xml_original.is_(None), Nfse.xml_original == ""))
+    if so_sem_competencia:
+        query = query.where(or_(Nfse.competencia.is_(None), Nfse.competencia == ""))
+    if iss_sem_aliquota:
+        query = query.where(and_(func.coalesce(Nfse.valor_iss, 0) > 0, func.coalesce(Nfse.aliquota_iss, 0) == 0))
     if valor_min is not None:
         query = query.where(Nfse.valor_servico >= valor_min)
     if valor_max is not None:
@@ -712,7 +729,11 @@ async def notas_dashboard_resumo(
             func.count(Nfse.id).label("total_notas"),
             func.coalesce(func.sum(Nfse.valor_servico), 0).label("total_valor_servico"),
             func.coalesce(func.sum(Nfse.valor_iss), 0).label("total_iss"),
-            func.coalesce(func.sum(Nfse.valor_iss_retido), 0).label("total_iss_retido"),
+            # tpRetISSQN=2 (ISS retido pelo tomador). Não usamos valor_iss_retido:
+            # o ADN jamais preenche vRetISSQN; a retenção, quando existe, é o vISSQN da própria nota.
+            func.coalesce(func.sum(case((Nfse.iss_retido == "2", Nfse.valor_iss), else_=0)), 0).label("total_iss_retido"),
+            func.coalesce(func.sum(case((func.lower(Nfse.role) == "prestado", Nfse.valor_servico), else_=0)), 0).label("total_valor_prestado"),
+            func.coalesce(func.sum(case((func.lower(Nfse.role) == "tomado", Nfse.valor_servico), else_=0)), 0).label("total_valor_tomado"),
         )
         .join(DocumentoFiscal, Nfse.documento_fiscal_id == DocumentoFiscal.id)
         .join(Company, DocumentoFiscal.empresa_id == Company.id)
@@ -775,6 +796,8 @@ async def notas_dashboard_resumo(
         total_valor_servico=float(row.total_valor_servico or 0),
         total_iss=float(row.total_iss or 0),
         total_iss_retido=float(row.total_iss_retido or 0),
+        valor_prestado=float(row.total_valor_prestado or 0),
+        valor_tomado=float(row.total_valor_tomado or 0),
         notas_prestadas=_count(role_value="prestado"),
         notas_tomadas=_count(role_value="tomado"),
         notas_outras=_count(extra=or_(Nfse.role.is_(None), func.lower(Nfse.role).notin_(["prestado", "tomado"]))),
@@ -842,6 +865,7 @@ async def notas_dashboard_series(
                 Nfse.competencia.label("competencia"),
                 func.lower(Nfse.role).label("role"),
                 func.count(Nfse.id).label("total"),
+                func.coalesce(func.sum(Nfse.valor_servico), 0).label("valor"),
             )
             .select_from(Nfse)
             .join(DocumentoFiscal, Nfse.documento_fiscal_id == DocumentoFiscal.id)
@@ -859,8 +883,10 @@ async def notas_dashboard_series(
     ).all()
 
     role_by_comp = {}
+    valor_by_comp = {}
     for r in roles:
         role_by_comp.setdefault(r.competencia, {})[r.role] = r.total
+        valor_by_comp.setdefault(r.competencia, {})[r.role] = float(r.valor or 0)
 
     return [
         DashboardSerieItem(
@@ -870,6 +896,8 @@ async def notas_dashboard_series(
             notas_tomadas=role_by_comp.get(r.competencia, {}).get("tomado", 0),
             valor_servico=float(r.valor_servico or 0),
             valor_iss=float(r.valor_iss or 0),
+            valor_prestado=valor_by_comp.get(r.competencia, {}).get("prestado", 0.0),
+            valor_tomado=valor_by_comp.get(r.competencia, {}).get("tomado", 0.0),
         )
         for r in totals
     ]
@@ -894,6 +922,8 @@ async def notas_dashboard_empresas(
                 func.count(Nfse.id).label("total_notas"),
                 func.coalesce(func.sum(Nfse.valor_servico), 0).label("valor_servico"),
                 func.coalesce(func.sum(Nfse.valor_iss), 0).label("valor_iss"),
+                func.coalesce(func.sum(case((func.lower(Nfse.role) == "prestado", Nfse.valor_servico), else_=0)), 0).label("valor_prestado"),
+                func.coalesce(func.sum(case((func.lower(Nfse.role) == "tomado", Nfse.valor_servico), else_=0)), 0).label("valor_tomado"),
             )
             .select_from(Nfse)
             .join(DocumentoFiscal, Nfse.documento_fiscal_id == DocumentoFiscal.id)
@@ -903,7 +933,7 @@ async def notas_dashboard_empresas(
                 DocumentoFiscal.ativo == True,
             )
             .group_by(Company.id, Company.nome, Company.cnpj)
-            .order_by(func.count(Nfse.id).desc())
+            .order_by(func.coalesce(func.sum(Nfse.valor_servico), 0).desc())
             .limit(limit),
             empresa_id=empresa_id,
             competencia_inicio=competencia_inicio,
@@ -920,9 +950,506 @@ async def notas_dashboard_empresas(
             total_notas=r.total_notas or 0,
             valor_servico=float(r.valor_servico or 0),
             valor_iss=float(r.valor_iss or 0),
+            valor_prestado=float(r.valor_prestado or 0),
+            valor_tomado=float(r.valor_tomado or 0),
         )
         for r in rows
     ]
+
+
+# ---------------------------------------------------------------------------
+# Análise por empresa (endpoint único para a tela de estudo)
+# ---------------------------------------------------------------------------
+
+
+def _shift_ym(ym: str, delta: int) -> str:
+    """Desloca YYYY-MM em delta meses (delta negativo = passado)."""
+    ano, mes = int(ym[:4]), int(ym[5:7])
+    total = ano * 12 + (mes - 1) + delta
+    return f"{total // 12:04d}-{total % 12 + 1:02d}"
+
+
+def _months_between(inicio: str, fim: str) -> List[str]:
+    months: List[str] = []
+    cur = inicio
+    while cur <= fim:
+        months.append(cur)
+        cur = _shift_ym(cur, 1)
+    return months
+
+
+@router.get("/analise/empresa", response_model=AnaliseEmpresaOut)
+async def analise_empresa(
+    empresa_id: int = Query(..., description="ID da empresa a analisar"),
+    role: Optional[str] = Query(None, pattern="^(prestado|tomado)$"),
+    competencia_inicio: Optional[str] = Query(None, description="Competência inicial YYYY-MM"),
+    competencia_fim: Optional[str] = Query(None, description="Competência final YYYY-MM"),
+    db: Session = Depends(get_db),
+    api_key: str = Depends(api_key_dep),
+):
+    empresa = db.execute(select(Company).where(Company.id == empresa_id)).scalar_one_or_none()
+    if not empresa:
+        raise HTTPException(status_code=404, detail="Empresa não encontrada")
+
+    # Contrapartes da análise ABC: papel-aware (prestado → tomador; tomado → prestador).
+    # Sob papel=Todos, conta uma par por (contraparte × papel).
+    cliente_par_cnpj = case(
+        (func.lower(Nfse.role) == "prestado", func.coalesce(Nfse.cnpj_tomador, Nfse.razao_social_tomador)),
+        else_=func.coalesce(Nfse.cnpj_prestador, Nfse.razao_social_prestador),
+    )
+    cliente_par_nome = case(
+        (func.lower(Nfse.role) == "prestado", Nfse.razao_social_tomador),
+        else_=Nfse.razao_social_prestador,
+    )
+    cliente_key = func.coalesce(func.nullif(cliente_par_cnpj, ""), cliente_par_nome)
+
+    def apply_filters(query):
+        return _apply_nota_filters(
+            query,
+            empresa_id=empresa_id,
+            competencia_inicio=competencia_inicio,
+            competencia_fim=competencia_fim,
+            role=role,
+        )
+
+    def base_join(query):
+        return (
+            query
+            .select_from(Nfse)
+            .join(DocumentoFiscal, Nfse.documento_fiscal_id == DocumentoFiscal.id)
+            .join(Company, DocumentoFiscal.empresa_id == Company.id)
+            .where(
+                DocumentoFiscal.tipo_documento == TipoDocumento.NFSE,
+                DocumentoFiscal.ativo == True,
+            )
+        )
+
+    def scalar(query):
+        return db.execute(apply_filters(base_join(query))).scalar() or 0
+
+    # ── 1) KPIs + únicos ───────────────────────────────────────────
+    kpi_row = db.execute(
+        apply_filters(
+            base_join(
+                select(
+                    func.count(Nfse.id).label("total_notas"),
+                    func.coalesce(func.sum(case((func.lower(Nfse.role) == "prestado", Nfse.valor_servico), else_=0)), 0).label("valor_prestado"),
+                    func.coalesce(func.sum(case((func.lower(Nfse.role) == "tomado", Nfse.valor_servico), else_=0)), 0).label("valor_tomado"),
+                    func.count(case((func.lower(Nfse.role) == "prestado", 1))).label("notas_prestadas"),
+                    func.count(case((func.lower(Nfse.role) == "tomado", 1))).label("notas_tomadas"),
+                    func.coalesce(func.sum(Nfse.valor_retido_cp), 0).label("valor_retido_cp"),
+                    func.coalesce(func.sum(Nfse.valor_retido_irrf), 0).label("valor_retido_irrf"),
+                    # Mesma regra do dashboard: valor_iss_retido vem de vISSQN das notas
+                    # tpRetISSQN=2 (retenção pelo tomador); vRetISSQN chega zerado no XML.
+                    func.coalesce(func.sum(case((Nfse.iss_retido == "2", Nfse.valor_iss), else_=0)), 0).label("valor_iss_retido"),
+                    func.count(case((Nfse.iss_retido == "2", 1))).label("notas_iss_retido"),
+                    func.count(
+                        case((and_(func.coalesce(Nfse.valor_iss, 0) > 0, func.coalesce(Nfse.aliquota_iss, 0) == 0), 1))
+                    ).label("iss_sem_aliquota"),
+                )
+            )
+        )
+    ).first()
+
+    total_notas = kpi_row.total_notas or 0
+    valor_prestado = float(kpi_row.valor_prestado or 0)
+    valor_tomado = float(kpi_row.valor_tomado or 0)
+    total_servicos = valor_prestado + valor_tomado
+    ticket_medio = total_servicos / total_notas if total_notas else 0.0
+    valor_retido_cp = float(kpi_row.valor_retido_cp or 0)
+    valor_retido_irrf = float(kpi_row.valor_retido_irrf or 0)
+    valor_iss_retido = float(kpi_row.valor_iss_retido or 0)
+    notas_iss_retido = int(kpi_row.notas_iss_retido or 0)
+    iss_sem_aliquota = int(kpi_row.iss_sem_aliquota or 0)
+    pct_retido_cp_irrf = ((valor_retido_cp + valor_retido_irrf) / total_servicos * 100) if total_servicos else None
+
+    def contar(extra=None):
+        q = apply_filters(base_join(select(func.count(Nfse.id))))
+        if extra is not None:
+            q = q.where(extra)
+        return db.execute(q).scalar() or 0
+
+    canceladas = contar(Nfse.tipo_evento.is_not(None))
+    sem_xml = contar(or_(Nfse.xml_original.is_(None), Nfse.xml_original == ""))
+    sem_competencia = contar(or_(Nfse.competencia.is_(None), Nfse.competencia == ""))
+    sem_papel = contar(or_(Nfse.role.is_(None), func.lower(Nfse.role).not_in(("prestado", "tomado"))))
+
+    # Contrapartes únicas pelo mesmo papel das seções de ABC (modo "todas" = clientes)
+    clientes_unicos = db.execute(
+        _apply_nota_filters(
+            base_join(
+                select(
+                    func.count(
+                        func.distinct(func.concat_ws('|', cliente_key, func.lower(Nfse.role)))
+                    )
+                ).where(cliente_key.isnot(None))
+            ),
+            empresa_id=empresa_id,
+            competencia_inicio=competencia_inicio,
+            competencia_fim=competencia_fim,
+            role=role,
+        )
+    ).scalar() or 0
+
+    # ── 2) Variação vs período anterior igual ────────────────────────
+    periodo_anterior = ""
+    var_prestado = None
+    var_tomado = None
+    if competencia_inicio and competencia_fim:
+        months = _months_between(competencia_inicio, competencia_fim)
+        n = len(months)
+        if n > 0:
+            prev_fim = _shift_ym(competencia_inicio, -1)
+            prev_ini = _shift_ym(prev_fim, -(n - 1))
+            periodo_anterior = f"{prev_ini} a {prev_fim} (período anterior igual)"
+            prev_row = db.execute(
+                _apply_nota_filters(
+                    base_join(
+                        select(
+                            func.coalesce(func.sum(case((func.lower(Nfse.role) == "prestado", Nfse.valor_servico), else_=0)), 0).label("valor_prestado"),
+                            func.coalesce(func.sum(case((func.lower(Nfse.role) == "tomado", Nfse.valor_servico), else_=0)), 0).label("valor_tomado"),
+                        )
+                    ),
+                    empresa_id=empresa_id,
+                    competencia_inicio=prev_ini,
+                    competencia_fim=prev_fim,
+                    role=role,
+                )
+            ).first()
+            prev_prest = float(prev_row.valor_prestado or 0) if prev_row else 0.0
+            prev_tom = float(prev_row.valor_tomado or 0) if prev_row else 0.0
+            var_prestado = (valor_prestado - prev_prest) / prev_prest if prev_prest > 0 else None
+            var_tomado = (valor_tomado - prev_tom) / prev_tom if prev_tom > 0 else None
+    else:
+        # Sem janela explícita: compara últimos 12 meses de dados vs 12 anteriores (TTM)
+        last = db.execute(
+            apply_filters(base_join(select(func.max(Nfse.competencia))))
+        ).scalar()
+        if last:
+            fim_ttm = last
+            ini_ttm = _shift_ym(fim_ttm, -11)
+            prev_fim = _shift_ym(ini_ttm, -1)
+            prev_ini = _shift_ym(prev_fim, -11)
+            periodo_anterior = f"últimos 12m vs 12m anteriores ({prev_ini} a {prev_fim})"
+            curr_row = db.execute(
+                _apply_nota_filters(
+                    base_join(
+                        select(
+                            func.coalesce(func.sum(case((func.lower(Nfse.role) == "prestado", Nfse.valor_servico), else_=0)), 0).label("valor_prestado"),
+                            func.coalesce(func.sum(case((func.lower(Nfse.role) == "tomado", Nfse.valor_servico), else_=0)), 0).label("valor_tomado"),
+                        )
+                    ),
+                    empresa_id=empresa_id,
+                    competencia_inicio=ini_ttm,
+                    competencia_fim=fim_ttm,
+                    role=role,
+                )
+            ).first()
+            prev_row = db.execute(
+                _apply_nota_filters(
+                    base_join(
+                        select(
+                            func.coalesce(func.sum(case((func.lower(Nfse.role) == "prestado", Nfse.valor_servico), else_=0)), 0).label("valor_prestado"),
+                            func.coalesce(func.sum(case((func.lower(Nfse.role) == "tomado", Nfse.valor_servico), else_=0)), 0).label("valor_tomado"),
+                        )
+                    ),
+                    empresa_id=empresa_id,
+                    competencia_inicio=prev_ini,
+                    competencia_fim=prev_fim,
+                    role=role,
+                )
+            ).first()
+            curr_prest = float(curr_row.valor_prestado or 0) if curr_row else 0.0
+            curr_tom = float(curr_row.valor_tomado or 0) if curr_row else 0.0
+            prev_prest = float(prev_row.valor_prestado or 0) if prev_row else 0.0
+            prev_tom = float(prev_row.valor_tomado or 0) if prev_row else 0.0
+            var_prestado = (curr_prest - prev_prest) / prev_prest if prev_prest > 0 else None
+            var_tomado = (curr_tom - prev_tom) / prev_tom if prev_tom > 0 else None
+
+    # ── 3) Série mensal (mesma forma da dashboard de notas) ───────────
+    totals = db.execute(
+        apply_filters(
+            base_join(
+                select(
+                    Nfse.competencia.label("competencia"),
+                    func.count(Nfse.id).label("total_notas"),
+                    func.coalesce(func.sum(Nfse.valor_servico), 0).label("valor_servico"),
+                    func.coalesce(func.sum(Nfse.valor_iss), 0).label("valor_iss"),
+                )
+            )
+            .group_by(Nfse.competencia)
+            .order_by(Nfse.competencia)
+        )
+    ).all()
+
+    roles = db.execute(
+        apply_filters(
+            base_join(
+                select(
+                    Nfse.competencia.label("competencia"),
+                    func.lower(Nfse.role).label("role"),
+                    func.count(Nfse.id).label("total"),
+                    func.coalesce(func.sum(Nfse.valor_servico), 0).label("valor"),
+                )
+            )
+            .group_by(Nfse.competencia, func.lower(Nfse.role))
+        )
+    ).all()
+
+    role_by_comp: dict = {}
+    valor_by_comp: dict = {}
+    for r in roles:
+        role_by_comp.setdefault(r.competencia, {})[r.role] = r.total
+        valor_by_comp.setdefault(r.competencia, {})[r.role] = float(r.valor or 0)
+
+    serie = [
+        DashboardSerieItem(
+            competencia=r.competencia,
+            total_notas=r.total_notas or 0,
+            notas_prestadas=role_by_comp.get(r.competencia, {}).get("prestado", 0),
+            notas_tomadas=role_by_comp.get(r.competencia, {}).get("tomado", 0),
+            valor_servico=float(r.valor_servico or 0),
+            valor_iss=float(r.valor_iss or 0),
+            valor_prestado=valor_by_comp.get(r.competencia, {}).get("prestado", 0.0),
+            valor_tomado=valor_by_comp.get(r.competencia, {}).get("tomado", 0.0),
+        )
+        for r in totals
+    ]
+
+    # ── 4) Mix de atividades: grupo por código tributário (chave estável) ──
+    total_valor = db.execute(
+        apply_filters(base_join(select(func.coalesce(func.sum(Nfse.valor_servico), 0))))
+    ).scalar() or 0
+
+    def atividade_label(key, desc, trib):
+        key = (key or "").strip()
+        desc = (desc or "").strip()
+        trib = (trib or "").strip()
+        for sep in (" - Conforme Lei", ", Conforme Lei", " Conforme Lei"):
+            idx = desc.find(sep)
+            if idx > 0:
+                desc = desc[:idx].rstrip(" -,")
+                break
+        if key.isdigit():
+            return f"{key} — {trib}" if trib else (f"{key} — {desc[:60]}" if desc else key)
+        return (desc or key or "Sem descrição")[:110]
+
+    key_expr = func.coalesce(func.nullif(Nfse.codigo_servico, ""), func.nullif(Nfse.descricao_servico, ""))
+
+    def base_actividadades():
+        papel = func.lower(Nfse.role)
+        return base_join(
+            select(
+                key_expr.label("atividade_key"),
+                papel.label("papel"),
+                func.max(func.nullif(Nfse.tributo_nacional, "")).label("tributo_nacional"),
+                func.max(func.nullif(Nfse.descricao_servico, "")).label("descricao"),
+                func.count(Nfse.id).label("notas"),
+                func.count(case((papel == "prestado", 1))).label("notas_prestadas"),
+                func.count(case((papel == "tomado", 1))).label("notas_tomadas"),
+                func.coalesce(func.sum(Nfse.valor_servico), 0).label("valor"),
+                func.coalesce(func.sum(case((papel == "prestado", Nfse.valor_servico), else_=0)), 0).label("valor_prestado"),
+                func.coalesce(func.sum(case((papel == "tomado", Nfse.valor_servico), else_=0)), 0).label("valor_tomado"),
+            ).where(key_expr.isnot(None), papel.in_(["prestado", "tomado"]))
+        ).group_by("atividade_key", papel)
+
+    mix_rows = db.execute(
+        apply_filters(
+            base_actividadades()
+        )
+        .order_by(func.sum(Nfse.valor_servico).desc())
+        .limit(20 if not role else 10)
+    ).all()
+
+    valor_prestado_total = float(valor_prestado or 0)
+    valor_tomado_total = float(valor_tomado or 0)
+    mix = []
+    for r in mix_rows:
+        key = (r.atividade_key or "").strip()
+        label = atividade_label(key, r.descricao, r.tributo_nacional)
+        if not label:
+            continue
+        papel_row = (r.papel or "").strip()
+        row_valor = float(r.valor or 0)
+        papel_total = valor_prestado_total if papel_row == "prestado" else valor_tomado_total
+        mix.append(
+            AnaliseAtividadeItem(
+                atividade=label,
+                papel=papel_row or None,
+                notas=r.notas or 0,
+                valor=row_valor,
+                pct=(row_valor / papel_total * 100) if papel_total else 0.0,
+                notas_prestadas=r.notas_prestadas or 0,
+                valor_prestado=float(r.valor_prestado or 0),
+                notas_tomadas=r.notas_tomadas or 0,
+                valor_tomado=float(r.valor_tomado or 0),
+            )
+        )
+
+    atividade_dominante = mix[0].atividade if mix else None
+    atividade_dominante_pct = mix[0].pct if mix else None
+
+    # ── 5) Top contrapartes (ABC por R$), separado por papel ───────────
+    cliente_rows = db.execute(
+        _apply_nota_filters(
+            base_join(
+                select(
+                    cliente_key.label("cnpj"),
+                    func.max(cliente_par_nome).label("nome"),
+                    func.lower(Nfse.role).label("papel"),
+                    func.count(Nfse.id).label("notas"),
+                    func.coalesce(func.sum(Nfse.valor_servico), 0).label("valor"),
+                ).where(cliente_key.isnot(None))
+            ),
+            empresa_id=empresa_id,
+            competencia_inicio=competencia_inicio,
+            competencia_fim=competencia_fim,
+            role=role,
+        )
+        .group_by(cliente_key, func.lower(Nfse.role))
+        .order_by(func.sum(Nfse.valor_servico).desc())
+    ).all()
+
+    # Curva A: quantos clientes concentram os primeiros 80% do faturamento
+    clientes_curva_a = 0
+    _acum80 = 0.0
+    total_val_80 = float(total_valor or 0)
+    for r in cliente_rows:
+        _acum80 += float(r.valor or 0)
+        clientes_curva_a += 1
+        if total_val_80 and _acum80 >= 0.8 * total_val_80:
+            break
+    clientes_curva_a_pct_base = (clientes_curva_a / len(cliente_rows) * 100) if cliente_rows else None
+
+    acumulado = 0.0
+    clientes: List[AnaliseClienteItem] = []
+    for r in cliente_rows[:10]:
+        valor = float(r.valor or 0)
+        acumulado += valor
+        clientes.append(
+            AnaliseClienteItem(
+                cliente=r.nome,
+                cnpj=r.cnpj,
+                papel=(r.papel or None),
+                notas=r.notas or 0,
+                valor=valor,
+                pct=(valor / float(total_valor) * 100) if total_valor else 0.0,
+                pct_acum=(acumulado / float(total_valor) * 100) if total_valor else 0.0,
+            )
+        )
+
+    # Mesma lente, ordenada por VOLUME de notas (respostas idênticas na lente fornecedor)
+    qtd_papel = sum(int(r.notas or 0) for r in cliente_rows)  # total de notas do papel atual
+    qtd_rows = sorted(cliente_rows, key=lambda r: (r.notas or 0), reverse=True)[:10]
+    acumulado_n = 0.0
+    clientes_por_notas: List[AnaliseClienteItem] = []
+    for r in qtd_rows:
+        n = int(r.notas or 0)
+        acumulado_n += n
+        valor = float(r.valor or 0)
+        clientes_por_notas.append(
+            AnaliseClienteItem(
+                cliente=r.nome,
+                cnpj=r.cnpj,
+                papel=(r.papel or None),
+                notas=n,
+                valor=valor,
+                pct=(valor / float(total_valor) * 100) if total_valor else 0.0,
+                pct_acum=0.0,
+                pct_notas_acum=(acumulado_n / qtd_papel * 100) if qtd_papel else None,
+            )
+        )
+
+    def build_matriz(papel: str, base_total: float, limite: int = 10) -> List[AnaliseMatrizItem]:
+        if papel == "prestado":
+            contra_cnpj, contra_nome = Nfse.cnpj_tomador, Nfse.razao_social_tomador
+        else:
+            contra_cnpj, contra_nome = Nfse.cnpj_prestador, Nfse.razao_social_prestador
+
+        rows = db.execute(
+            _apply_nota_filters(
+                base_join(
+                    select(
+                        key_expr.label("atividade_key"),
+                        func.max(func.nullif(Nfse.tributo_nacional, "")).label("tributo_nacional"),
+                        func.max(func.nullif(Nfse.descricao_servico, "")).label("descricao"),
+                        func.coalesce(func.nullif(contra_cnpj, ""), contra_nome).label("cnpj"),
+                        func.max(contra_nome).label("nome"),
+                        func.count(Nfse.id).label("notas"),
+                        func.coalesce(func.sum(Nfse.valor_servico), 0).label("valor"),
+                    )
+                    .where(and_(func.coalesce(func.nullif(contra_cnpj, ""), contra_nome).isnot(None), key_expr.isnot(None)))
+                ),
+                empresa_id=empresa_id,
+                competencia_inicio=competencia_inicio,
+                competencia_fim=competencia_fim,
+                role=papel,
+            )
+            .group_by("atividade_key", func.coalesce(func.nullif(contra_cnpj, ""), contra_nome))
+            .order_by(func.sum(Nfse.valor_servico).desc())
+            .limit(limite)
+        ).all()
+
+        items: List[AnaliseMatrizItem] = []
+        for r in rows:
+            key = (r.atividade_key or "").strip()
+            label = atividade_label(key, r.descricao, r.tributo_nacional)
+            if not label:
+                continue
+            valor = float(r.valor or 0)
+            items.append(
+                AnaliseMatrizItem(
+                    atividade=label,
+                    cliente=r.nome,
+                    cnpj=r.cnpj,
+                    papel=papel,
+                    notas=r.notas or 0,
+                    valor=valor,
+                    pct=(valor / base_total * 100) if base_total else 0.0,
+                )
+            )
+        return items
+
+    matriz_prestadas = build_matriz("prestado", float(valor_prestado or 0))
+    matriz_tomadas = build_matriz("tomado", float(valor_tomado or 0))
+
+    return AnaliseEmpresaOut(
+        empresa_nome=empresa.nome,
+        empresa_cnpj=empresa.cnpj,
+        role=role,
+        competencia_inicio=competencia_inicio,
+        competencia_fim=competencia_fim,
+        periodo_anterior=periodo_anterior,
+        total_notas=total_notas,
+        notas_prestadas=kpi_row.notas_prestadas or 0,
+        notas_tomadas=kpi_row.notas_tomadas or 0,
+        valor_prestado=valor_prestado,
+        valor_tomado=valor_tomado,
+        clientes_unicos=clientes_unicos,
+        ticket_medio=ticket_medio,
+        var_prestado_anterior=var_prestado,
+        var_tomado_anterior=var_tomado,
+        canceladas=canceladas,
+        sem_xml=sem_xml,
+        sem_competencia=sem_competencia,
+        sem_papel=sem_papel,
+        valor_retido_cp=valor_retido_cp,
+        valor_retido_irrf=valor_retido_irrf,
+        pct_retido_cp_irrf=pct_retido_cp_irrf,
+        valor_iss_retido=valor_iss_retido,
+        notas_iss_retido=notas_iss_retido,
+        iss_sem_aliquota=iss_sem_aliquota,
+        clientes_curva_a=clientes_curva_a,
+        clientes_curva_a_pct_base=clientes_curva_a_pct_base,
+        atividade_dominante=atividade_dominante,
+        atividade_dominante_pct=atividade_dominante_pct,
+        serie=serie,
+        mix=mix,
+        clientes=clientes,
+        clientes_por_notas=clientes_por_notas,
+        matriz_prestadas=matriz_prestadas,
+        matriz_tomadas=matriz_tomadas,
+    )
 
 
 @router.get("/notas", response_model=PaginatedResponse[NotaResumoOut])
@@ -937,6 +1464,10 @@ async def list_notas(
     search: Optional[str] = Query(None),
     valor_min: Optional[float] = Query(None),
     valor_max: Optional[float] = Query(None),
+    so_canceladas: bool = Query(False),
+    so_sem_xml: bool = Query(False),
+    so_sem_competencia: bool = Query(False),
+    iss_sem_aliquota: bool = Query(False),
     sort: str = Query("competencia"),
     order: str = Query("desc"),
     page: int = Query(1, ge=1),
@@ -956,6 +1487,10 @@ async def list_notas(
         search=search,
         valor_min=valor_min,
         valor_max=valor_max,
+        so_canceladas=so_canceladas,
+        so_sem_xml=so_sem_xml,
+        so_sem_competencia=so_sem_competencia,
+        iss_sem_aliquota=iss_sem_aliquota,
     )
     total = db.execute(select(func.count()).select_from(base.subquery())).scalar() or 0
 
@@ -1010,6 +1545,27 @@ async def get_nota_xml(nota_id: int, db: Session = Depends(get_db), api_key: str
     return Response(
         content=n.xml_original,
         media_type="application/xml",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@router.get("/notas/{nota_id}/danfse")
+async def get_nota_danfse(nota_id: int, db: Session = Depends(get_db), api_key: str = Depends(api_key_dep)):
+    n = db.execute(select(Nfse).where(Nfse.id == nota_id)).scalar_one_or_none()
+    if not n or not n.xml_original:
+        raise HTTPException(status_code=404, detail="XML não encontrado")
+    doc = db.execute(select(DocumentoFiscal).where(DocumentoFiscal.id == n.documento_fiscal_id)).scalar_one_or_none()
+    situacao = (doc.situacao if doc else "normal") or "normal"
+    # tpRetISSQN/eventos espelhados no doc.situacao: cancelada→2, substituida→1, válida→0
+    stc = 2 if situacao == "cancelada" else (1 if situacao == "substituida" else 0)
+    try:
+        pdf = await gerar_danfse(n.xml_original, stc=stc)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+    filename = f"DANFSe_{n.chave_acesso or n.numero_nfse or nota_id}.pdf"
+    return Response(
+        content=pdf,
+        media_type="application/pdf",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
 

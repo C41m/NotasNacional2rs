@@ -17,7 +17,7 @@ class NfseBase(BaseModel):
     local_incidencia_descricao: Optional[str] = Field(None, max_length=150) # xLocIncida
     tributo_nacional: Optional[str] = None                                  # xTribNac
     tributo_municipal: Optional[str] = None                                 # xTribMun
-    codigo_nbs: Optional[str] = Field(None, max_length=20)                  # xNBS
+    codigo_nbs: Optional[str] = None                                           # xNBS (descrição, sem limite)
     versao_aplicacao: Optional[str] = Field(None, max_length=50)            # verAplic
     ambiente_gerador: Optional[str] = Field(None, max_length=1)             # ambGer
     tipo_emissao: Optional[str] = Field(None, max_length=1)                 # tpEmis
@@ -172,6 +172,8 @@ class DashboardResumoOut(BaseModel):
     ultima_sincronizacao: Optional[datetime] = None
     notas_novas_desde_ontem: int = 0
     saude_conferencia: str = "ok"  # "ok" | "atencao"
+    valor_prestado: float = 0
+    valor_tomado: float = 0
 
 
 class DashboardSerieItem(BaseModel):
@@ -181,6 +183,8 @@ class DashboardSerieItem(BaseModel):
     notas_tomadas: int = 0
     valor_servico: float = 0
     valor_iss: float = 0
+    valor_prestado: float = 0
+    valor_tomado: float = 0
 
 
 class DashboardEmpresaItem(BaseModel):
@@ -192,6 +196,100 @@ class DashboardEmpresaItem(BaseModel):
     notas_tomadas: int = 0
     valor_servico: float = 0
     valor_iss: float = 0
+    valor_prestado: float = 0
+    valor_tomado: float = 0
+
+
+# ---------------------------------------------------------------------------
+# Análise por empresa (tela /analise/empresa)
+# ---------------------------------------------------------------------------
+
+
+class AnaliseAtividadeItem(BaseModel):
+    atividade: str
+    papel: Optional[str] = None  # prestado | tomado (linha do mix = atividade × papel)
+    notas: int = 0
+    valor: float = 0
+    pct: float = 0
+    # Desdobramento por papel (para a tabela separada)
+    notas_prestadas: int = 0
+    valor_prestado: float = 0
+    notas_tomadas: int = 0
+    valor_tomado: float = 0
+
+
+class AnaliseMatrizItem(BaseModel):
+    atividade: str
+    cliente: Optional[str] = None
+    cnpj: Optional[str] = None
+    papel: Optional[str] = None  # prestado | tomado (lente usada na contraparte)
+    notas: int = 0
+    valor: float = 0
+    pct: float = 0
+
+
+class AnaliseClienteItem(BaseModel):
+    cliente: Optional[str] = None
+    cnpj: Optional[str] = None
+    papel: Optional[str] = None  # prestado | tomado (papel da contraparte)
+    notas: int = 0
+    valor: float = 0
+    pct: float = 0
+    pct_acum: float = 0
+    # Preenchido apenas na lista "Por quantidade" (pct_acum lá = % acumulado de NOTAS)
+    pct_notas_acum: Optional[float] = None
+
+
+class AnaliseEmpresaOut(BaseModel):
+    empresa_nome: Optional[str] = None
+    empresa_cnpj: Optional[str] = None
+    role: Optional[str] = None
+    competencia_inicio: Optional[str] = None
+    competencia_fim: Optional[str] = None
+    periodo_anterior: str = ""
+
+    total_notas: int = 0
+    notas_prestadas: int = 0
+    notas_tomadas: int = 0
+    valor_prestado: float = 0
+    valor_tomado: float = 0
+    clientes_unicos: int = 0
+    ticket_medio: float = 0
+
+    var_prestado_anterior: Optional[float] = None  # fração (0.12 = +12%)
+    var_tomado_anterior: Optional[float] = None
+
+    canceladas: int = 0
+    sem_xml: int = 0
+    sem_competencia: int = 0
+    sem_papel: int = 0  # notas com papel outlier/indefinido (≠ prestado/tomado)
+
+    # Retenções federais no período (prestadas + tomadas)
+    valor_retido_cp: float = 0
+    valor_retido_irrf: float = 0
+    pct_retido_cp_irrf: Optional[float] = None  # % sobre o total de serviços
+
+    # ISS retido (tpRetISSQN = 2 — retido pelo tomador)
+    valor_iss_retido: float = 0
+    notas_iss_retido: int = 0
+
+    # Notas com valor de ISS calculado mas alíquota não informada (data quality)
+    iss_sem_aliquota: int = 0
+
+    # Curva A: quantos clientes concentram os primeiros 80% do faturamento
+    clientes_curva_a: Optional[int] = None
+    clientes_curva_a_pct_base: Optional[float] = None  # % desses clientes sobre a base única
+
+    # Atividade dominante (top 1 do mix por R$)
+    atividade_dominante: Optional[str] = None
+    atividade_dominante_pct: Optional[float] = None
+
+    serie: List[DashboardSerieItem] = []
+    mix: List[AnaliseAtividadeItem] = []
+    clientes: List[AnaliseClienteItem] = []
+    clientes_por_notas: List[AnaliseClienteItem] = []
+    matriz_prestadas: List[AnaliseMatrizItem] = []
+    matriz_tomadas: List[AnaliseMatrizItem] = []
 
 
 # ---------------------------------------------------------------------------
