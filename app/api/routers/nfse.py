@@ -1683,6 +1683,8 @@ async def download_relatorio_nfse_xlsx(
                 "base_calculo_iss": float(n.base_calculo_iss or 0),
                 "aliquota_iss": float(n.aliquota_iss or 0),
                 "valor_iss": float(n.valor_iss or 0),
+                "valor_desconto_condicionado": float(n.valor_desconto_condicionado or 0),
+                "valor_desconto_incondicionado": float(n.valor_desconto_incondicionado or 0),
                 "iss_retido": n.iss_retido,
                 "tipo_evento": n.tipo_evento,
                 "descricao_evento": n.descricao_evento,
@@ -1873,7 +1875,7 @@ async def _process_batch_background(
                     elif role == "prestado":
                         notas_prestadas += 1
                         valor_prestado += vs
-                        if (campos.get("iss_retido") or "") == "1" or float(campos.get("valor_iss_retido") or 0) > 0:
+                        if (campos.get("iss_retido") or "") == "2":
                             notas_prestadas_com_retencao += 1
                             valor_prestado_com_retencao += vs
                         else:
@@ -2073,6 +2075,8 @@ def _gerar_zip_batch(batch_id: str, datainicio: str | None, datafim: str | None)
                             "base_calculo_iss": float(n.base_calculo_iss or 0),
                             "aliquota_iss": float(n.aliquota_iss or 0),
                             "valor_iss": float(n.valor_iss or 0),
+                            "valor_desconto_condicionado": float(n.valor_desconto_condicionado or 0),
+                            "valor_desconto_incondicionado": float(n.valor_desconto_incondicionado or 0),
                             "iss_retido": n.iss_retido,
                             "tipo_evento": n.tipo_evento,
                             "descricao_evento": n.descricao_evento,
