@@ -9,7 +9,6 @@ class Settings(BaseSettings):
     DEEPSEEK_API_KEY: str = ""
     DANFSE_SERVICE_URL: str = "http://localhost:8080/api/danfse"
     CORS_ORIGINS: Union[str, List[str], None] = None
-    PORT: int = 8000
     LOG_LEVEL: str = "INFO"
 
     def parse_cors_origins(self) -> List[str]:

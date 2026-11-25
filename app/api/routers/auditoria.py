@@ -8,7 +8,6 @@ from app.models.auditoria import Auditoria, AuditoriaPendencia
 from app.schemas.auditoria import (
     AuditoriaIngestRequest,
     AuditoriaOut,
-    AuditoriaResumoOut,
     AuditoriaPendenciaOut,
 )
 from app.services.auditoria_xlsx import gerar_xlsx_auditoria

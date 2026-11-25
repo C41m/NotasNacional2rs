@@ -12,7 +12,6 @@ from openpyxl.utils import get_column_letter
 # Estilos reutilizáveis
 HEADER_FONT = Font(name='Calibri', bold=True, size=11, color='FFFFFF')
 HEADER_FILL = PatternFill(start_color='1F3A5F', end_color='1F3A5F', fill_type='solid')
-SUBHEADER_FILL = PatternFill(start_color='2E5C8A', end_color='2E5C8A', fill_type='solid')
 TOTAL_FILL = PatternFill(start_color='DCE6F0', end_color='DCE6F0', fill_type='solid')
 ALT_ROW_FILL = PatternFill(start_color='F2F5F9', end_color='F2F5F9', fill_type='solid')
 WHITE_FILL = PatternFill(start_color='FFFFFF', end_color='FFFFFF', fill_type='solid')
@@ -35,14 +34,6 @@ HEADER_ALIGN = Alignment(horizontal='center', vertical='center', wrap_text=True)
 CENTER_ALIGN = Alignment(horizontal='center', vertical='center')
 RIGHT_ALIGN = Alignment(horizontal='right', vertical='center')
 LEFT_ALIGN = Alignment(horizontal='left', vertical='center')
-
-
-def _valor_brl(valor) -> str:
-    try:
-        v = float(valor or 0)
-    except (TypeError, ValueError):
-        v = 0
-    return f"R$ {v:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
 
 def _status_label(status: str) -> str:
@@ -87,15 +78,6 @@ def _apply_header_style(ws, row: int, max_col: int):
         cell.border = THIN_BORDER
 
 
-def _apply_subheader_style(ws, row: int, max_col: int):
-    for col in range(1, max_col + 1):
-        cell = ws.cell(row=row, column=col)
-        cell.font = HEADER_FONT
-        cell.fill = SUBHEADER_FILL
-        cell.alignment = HEADER_ALIGN
-        cell.border = THIN_BORDER
-
-
 def _apply_total_style(ws, row: int, max_col: int):
     for col in range(1, max_col + 1):
         cell = ws.cell(row=row, column=col)
@@ -115,17 +97,6 @@ def _apply_cell_style(ws, row: int, col: int, bold: bool = False, align: Alignme
         cell.fill = ALT_ROW_FILL
     else:
         cell.fill = WHITE_FILL
-
-
-def _auto_width(ws, min_width: int = 10, max_width: int = 50):
-    for col in ws.columns:
-        max_len = 0
-        col_letter = get_column_letter(col[0].column)
-        for cell in col:
-            if cell.value:
-                max_len = max(max_len, len(str(cell.value)))
-        adjusted = min(max(max_len + 2, min_width), max_width)
-        ws.column_dimensions[col_letter].width = adjusted
 
 
 def gerar_xlsx_auditoria(

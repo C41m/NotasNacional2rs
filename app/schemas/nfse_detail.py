@@ -100,10 +100,6 @@ class NfseBase(BaseModel):
     arquivo_fonte: Optional[str] = Field(None, max_length=500)
 
 
-class NfseCreate(NfseBase):
-    documento_fiscal_id: int = Field(..., gt=0)
-
-
 class NfseOut(NfseBase):
     id: int
     documento_fiscal_id: int
@@ -292,20 +288,4 @@ class AnaliseEmpresaOut(BaseModel):
     matriz_tomadas: List[AnaliseMatrizItem] = []
 
 
-# ---------------------------------------------------------------------------
-# Schemas para persistência de NFSe baixada via ADN
-# ---------------------------------------------------------------------------
-
-class NfseSalvarItem(BaseModel):
-    nsu: Optional[int] = None
-    tipo_documento_api: Optional[str] = None
-    role: Optional[str] = None
-    chave: Optional[str] = None
-    competencia: Optional[str] = Field(None, max_length=7, pattern=r"^\d{4}-\d{2}$")
-    xml: str
-
-
-class NfseSalvarRequest(BaseModel):
-    empresa_id: int = Field(..., gt=0)
-    xmls: List[NfseSalvarItem] = Field(..., min_length=1)
 

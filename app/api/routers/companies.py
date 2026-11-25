@@ -6,7 +6,6 @@ from app.core.database import get_db
 from app.services.certificate_service import save_certificate
 from app.schemas.company import CompanyCreate, CompanyUpdate, CompanyOut
 from app.models.company import Company
-from app.models.certificate import Certificate
 from typing import List
 
 router = APIRouter(prefix="/companies", tags=["companies"])

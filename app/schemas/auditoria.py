@@ -108,15 +108,4 @@ class AuditoriaOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
-class AuditoriaResumoOut(BaseModel):
-    id: int
-    cnpj: str
-    razao_social: str
-    periodo: str
-    status_geral: str
-    conformidade_pct: float
-    fator_r: Optional[float] = None
-    aliquota_efetiva: Optional[float] = None
-    classificacao_anexo: Optional[str] = None
 
-    model_config = ConfigDict(from_attributes=True)

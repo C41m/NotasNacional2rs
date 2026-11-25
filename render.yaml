@@ -13,6 +13,4 @@ services:
         fromSecret: cors-origins
       - key: DEEPSEEK_API_KEY
         sync: false
-      - key: PORT
-        value: "8000"
     autoDeploy: true

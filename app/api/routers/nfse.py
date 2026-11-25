@@ -4,14 +4,13 @@ from sqlalchemy.orm import Session
 from sqlalchemy import select, insert, func, update, text, or_, case, and_
 from typing import List, Optional
 from app.core.database import SessionLocal, get_db
-from app.schemas.nfse import NFSEDownloadRequest, NFSEDownloadResponse, NFSEDownloadStatus, BatchDownloadRequest
+from app.schemas.nfse import NFSEDownloadResponse, NFSEDownloadStatus, BatchDownloadRequest
 from app.models.download_job import DownloadJob
 from app.models.company import Company
 from app.models.documento_fiscal import DocumentoFiscal, TipoDocumento
 from app.models.nfse import Nfse
 from app.schemas.common import PaginatedResponse
 from app.schemas.nfse_detail import (
-    NfseSalvarRequest,
     NfseOut,
     NotaResumoOut,
     NotaDetalheOut,
@@ -80,7 +79,6 @@ async def _process_single_company_async(
     company_id: int,
     batch_id: str,
     batch_status: dict,
-    download_type: str = "xml",
     datainicio: str | None = None,
     datafim: str | None = None,
     force_update: bool = False,
@@ -1771,7 +1769,6 @@ async def start_batch_download(
         request.company_ids,
         request.datainicio,
         request.datafim,
-        request.download_type,
         request.force_update,
     )
 
@@ -1783,7 +1780,6 @@ async def _process_batch_background(
     company_ids: List[int],
     datainicio: str | None,
     datafim: str | None,
-    download_type: str,
     force_update: bool = False,
 ):
     """Processa o batch em background."""
@@ -1812,7 +1808,6 @@ async def _process_batch_background(
             company_id=company_id,
             batch_id=batch_id,
             batch_status=batch_status,
-            download_type=download_type,
             datainicio=datainicio,
             datafim=datafim,
             force_update=force_update,
