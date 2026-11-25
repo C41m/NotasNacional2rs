@@ -567,6 +567,10 @@ async def fetch_distribuicao(
                 response = await client.get(url)
 
                 if response.status_code == 404:
+                    # Algumas empresas nao respondem ao NSU 0; tenta a partir do 1
+                    if ult_nsu_atual == 0:
+                        ult_nsu_atual = 1
+                        continue
                     break
 
                 if response.status_code != 200:
@@ -574,10 +578,16 @@ async def fetch_distribuicao(
 
                 data = response.json()
                 if data.get("StatusProcessamento") == "NENHUM_DOCUMENTO_LOCALIZADO":
+                    if ult_nsu_atual == 0:
+                        ult_nsu_atual = 1
+                        continue
                     break
 
                 lote = data.get("LoteDFe", [])
                 if not lote:
+                    if ult_nsu_atual == 0:
+                        ult_nsu_atual = 1
+                        continue
                     break
 
                 for doc in lote:
