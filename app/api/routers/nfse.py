@@ -108,7 +108,7 @@ async def _process_single_company_async(
                 )
             ).scalars().all()
             
-            batch_status[batch_id][cid]["mensagem"] = f"Encontradas {len(notas_db)} notas, preparando..."
+            batch_status[batch_id]["companies"][cid]["mensagem"] = f"Encontradas {len(notas_db)} notas, preparando..."
             
             xmls = []
             for n in notas_db:
@@ -122,11 +122,11 @@ async def _process_single_company_async(
                 })
             
             if not xmls:
-                batch_status[batch_id][cid]["status"] = "success"
-                batch_status[batch_id][cid]["mensagem"] = "Nenhuma nota para atualizar"
+                batch_status[batch_id]["companies"][cid]["status"] = "success"
+                batch_status[batch_id]["companies"][cid]["mensagem"] = "Nenhuma nota para atualizar"
                 return (company_id, None, None, cnpj, nome, id_dominio, [])
             
-            batch_status[batch_id][cid]["mensagem"] = f"Re-extraindo {len(xmls)} notas..."
+            batch_status[batch_id]["companies"][cid]["mensagem"] = f"Re-extraindo {len(xmls)} notas..."
             return (company_id, None, None, cnpj, nome, id_dominio, xmls)
 
         result = await fetch_distribuicao(
@@ -226,6 +226,8 @@ def _marcar_notas_canceladas(db: Session, empresa_id: int, eventos: list[dict]) 
         if situacao_para_evento(tipo_evento) == "normal":
             continue
         descricao = ev.get("descricao")
+        if descricao:
+            descricao = str(descricao)[:100]  # coluna descricao_evento é VARCHAR(100)
         data_evento = ev.get("data_evento")
         doc = db.execute(
             select(DocumentoFiscal).where(
@@ -291,6 +293,8 @@ def _reconciliar_eventos_cancelamento(db: Session, empresa_id: int) -> int:
         chave_ref = ev.chave_nfe_referenciada
         tipo_evento = ev.tipo_evento
         descricao = ev.descricao_evento
+        if descricao:
+            descricao = str(descricao)[:100]  # VARCHAR(100)
         data_evento = ev.data_evento
 
         # Re-extrair do XML eventos salvos antes das correções (sem metadados persistidos)
@@ -298,6 +302,8 @@ def _reconciliar_eventos_cancelamento(db: Session, empresa_id: int) -> int:
             info = parse_xml_role_and_competence(ev.xml_original, "")
             tipo_evento = tipo_evento or info.get("evento_tipo")
             descricao = descricao or info.get("evento_descricao")
+            if descricao:
+                descricao = str(descricao)[:100]  # VARCHAR(100)
             chave_ref = chave_ref or info.get("chave_referenciada")
             data_evento = data_evento or _parse_data_evento(info.get("data_evento"))
             if tipo_evento:
@@ -361,8 +367,17 @@ def _salvar_notas_empresa(db: Session, empresa_id: int, xmls: list, force_update
     """
     from app.models.documento_fiscal import DocumentoFiscal, TipoDocumento
     from app.models.nfse import Nfse
+    from app.models.company import Company
     from sqlalchemy import update
     import hashlib
+
+    empresa_cnpj = ""
+    try:
+        emp = db.execute(select(Company).where(Company.id == empresa_id)).scalar_one_or_none()
+        if emp and emp.cnpj:
+            empresa_cnpj = "".join(ch for ch in emp.cnpj if ch.isdigit())
+    except Exception:
+        pass
 
     # A ADN dá ao evento de cancelamento a MESMA chave da NFS-e (chNFSe == chave_acesso).
     # Eventos NÃO são notas: devem sair do upsert e apenas marcar a nota original como cancelada.
@@ -484,11 +499,21 @@ def _salvar_notas_empresa(db: Session, empresa_id: int, xmls: list, force_update
 
             data_evento = _parse_data_evento(xml_data.get("data_evento"))
 
+            # Recomputa o papel a partir do XML com o CNPJ da empresa: o `role` que vem
+            # da chamada ADN pode estar errado (ex.: nota prestada pela própria empresa
+            # sendo salva como tomada). Fonte de verdade é o XML + CNPJ interessado.
+            role_calculado = None
+            if not evento_tipo:
+                info_xml = parse_xml_role_and_competence(xml_str, empresa_cnpj)
+                candidato = info_xml.get("role")
+                if candidato in ("prestado", "tomado", "intermediario"):
+                    role_calculado = candidato
+
             nfse_data = {
                 "chave_acesso": chave,
                 "nsu": xml_data.get("nsu"),
                 "tipo_documento_api": xml_data.get("tipo"),
-                "role": xml_data.get("role"),
+                "role": role_calculado or xml_data.get("role"),
                 "competencia": periodo,
                 "xml_original": xml_str,
                 "xml_hash": xml_hash,  # NOVO: armazenar hash para delta detection

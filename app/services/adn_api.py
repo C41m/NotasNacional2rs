@@ -55,7 +55,8 @@ def situacao_para_evento(evento_tipo: Optional[str]) -> str:
     if evento_tipo in EVENTO_CANCELAMENTO:
         return "cancelada"
     descricao = MAPEVENTOS.get(evento_tipo) or f"evento_{evento_tipo}"
-    return descricao.lower()
+    #DocumentoFiscal.situacao é VARCHAR(20)
+    return descricao.lower()[:20]
 
 
 class ADNError(Exception):
