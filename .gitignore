@@ -13,6 +13,7 @@ build/
 venv/
 env/
 .venv/
+.venv-dev/
 .env
 .env.local
 
@@ -32,3 +33,10 @@ crt/
 *.swp
 *.swo
 *.tmp
+
+# Serviço DANFSe (binário de terceiro, não versionar)
+/tools/danfse-service.exe
+
+# Logs e rascunhos de execução local
+backend-dev*.log
+repair-out.txt
