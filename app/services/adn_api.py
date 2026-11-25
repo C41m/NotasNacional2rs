@@ -621,7 +621,9 @@ async def fetch_distribuicao(
                 if len(lote) < 50:
                     break
 
-                ult_nsu_atual = max(doc.get("NSU", 0) for doc in lote) + 1
+                # A ADN usa limite INFERIOR EXCLUSIVO: /DFe/{N} devolve documentos com NSU > N.
+                # Avançar com max+1 pula o primeiro documento do próximo lote (NSU = max+1).
+                ult_nsu_atual = max(doc.get("NSU", 0) for doc in lote)
 
         finally:
             await client.aclose()
